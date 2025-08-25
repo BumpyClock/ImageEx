@@ -2,11 +2,15 @@
 
 	<PropertyGroup>
         <!-- Platform Properties -->
-        <Platforms>x64</Platforms>
-        <TargetFramework>net9.0-windows10.0.26100.0</TargetFramework>
-        <WindowsSdkPackageVersion>10.0.26100.57</WindowsSdkPackageVersion>
+        <Platforms>x86;x64;ARM64</Platforms>
+        <TargetFramework>net9.0-windows10.0.22621.0</TargetFramework>
+        <WindowsSdkPackageVersion>10.0.22621.42</WindowsSdkPackageVersion>
         <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
-        <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+        <RuntimeIdentifiers Condition="$([MSBuild]::GetTargetFrameworkVersion('$(TargetFramework)')) &gt;= 8">win-x86;win-x64;win-arm64</RuntimeIdentifiers>
+        <!-- Set RuntimeIdentifier based on Platform -->
+        <RuntimeIdentifier Condition="'$(Platform)' == 'x64'">win-x64</RuntimeIdentifier>
+        <RuntimeIdentifier Condition="'$(Platform)' == 'x86'">win-x86</RuntimeIdentifier>
+        <RuntimeIdentifier Condition="'$(Platform)' == 'ARM64'">win-arm64</RuntimeIdentifier>
         <EnableWindowsTargeting>true</EnableWindowsTargeting>
         <EnableMsixTooling>true</EnableMsixTooling>
 		<OutputType>Library</OutputType>
@@ -32,13 +36,14 @@
 	</PropertyGroup>
 	
 	<ItemGroup Condition="$(TargetFramework.Contains('windows'))">
-        <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.250702007-experimental4" />
+        <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.250606001" />
 	</ItemGroup>
 	
 	<ItemGroup>
 	  <PackageReference Include="CommunityToolkit.Common" Version="8.4.0" />
 	  <PackageReference Include="CommunityToolkit.WinUI.Extensions" Version="8.2.250402" />
 	  <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3477-prerelease" />
+	  <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.2.0" />
 	  <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4654" />
 	</ItemGroup>
 
