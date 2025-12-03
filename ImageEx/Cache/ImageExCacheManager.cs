@@ -228,27 +228,41 @@ internal sealed class ImageExCacheManager
         return await LoadFromStreamAsync(stream, isSvg, decodeWidth, decodeHeight, decodeType).ConfigureAwait(false);
     }
 
-    private static async Task<ImageSource?> LoadFromStreamAsync(
+        private static async Task<ImageSource?> LoadFromStreamAsync(
         Stream stream,
         bool isSvg,
         int decodeWidth,
         int decodeHeight,
         DecodePixelType decodeType)
-    {
-        if (isSvg)
         {
-            var svg = new SvgImageSource();
-            await svg.SetSourceAsync(stream.AsRandomAccessStream());
-            return svg;
+            if (isSvg)
+            {
+                var svg = new SvgImageSource();
+                await svg.SetSourceAsync(stream.AsRandomAccessStream());
+                return svg;
+            }
+
+        var targetWidth = decodeWidth;
+        var targetHeight = decodeHeight;
+
+        // If no decode hint was provided, pick a sane default to avoid full-res decode bloat.
+        if (targetWidth <= 0 && targetHeight <= 0)
+        {
+            targetWidth = 512;
         }
 
-        var bitmap = new BitmapImage();
-        if (decodeWidth > 0) bitmap.DecodePixelWidth = decodeWidth;
-        if (decodeHeight > 0) bitmap.DecodePixelHeight = decodeHeight;
-        bitmap.DecodePixelType = decodeType;
+        var bitmap = new BitmapImage
+        {
+            DecodePixelType = decodeType,
+            CreateOptions = BitmapCreateOptions.IgnoreImageCache
+        };
+
+        if (targetWidth > 0) bitmap.DecodePixelWidth = targetWidth;
+        if (targetHeight > 0) bitmap.DecodePixelHeight = targetHeight;
+
         await bitmap.SetSourceAsync(stream.AsRandomAccessStream());
         return bitmap;
-    }
+        }
 
     private async Task EnforceCleanupIfNeededAsync()
     {
