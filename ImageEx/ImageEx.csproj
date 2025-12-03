@@ -2,11 +2,10 @@
 
     <PropertyGroup>
         <!-- Platform Properties -->
-        <Platforms>x64</Platforms>
-        <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
-        <WindowsSdkPackageVersion>10.0.26100.57</WindowsSdkPackageVersion>
+        <Platforms>x86;x64;ARM64</Platforms>
+        <TargetFramework>net9.0-windows10.0.22621.0</TargetFramework>
         <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
-        <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+        <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
         <EnableWindowsTargeting>true</EnableWindowsTargeting>
         <EnableMsixTooling>true</EnableMsixTooling>
         <OutputType>Library</OutputType>
@@ -26,19 +25,16 @@
         <CsWinRTAotOptimizerEnabled>true</CsWinRTAotOptimizerEnabled>
     </PropertyGroup>
 
-    <PropertyGroup Condition="$(TargetFramework.Contains('net8.0'))">
-        <IsAotCompatible>true</IsAotCompatible>
-        <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
-    </PropertyGroup>
-
     <ItemGroup Condition="$(TargetFramework.Contains('windows'))">
         <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.251106002" />
+
     </ItemGroup>
 
     <ItemGroup>
         <PackageReference Include="CommunityToolkit.Common" Version="8.4.0" />
         <PackageReference Include="CommunityToolkit.WinUI.Extensions" Version="8.2.250402" />
-        <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.6901" />
+        <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.7175" />
+
     </ItemGroup>
 
 </Project>

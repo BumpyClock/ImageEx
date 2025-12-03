@@ -3,6 +3,7 @@
 // See the LICENSE file in the project root for more information.
 
 // ReSharper disable MemberCanBePrivate.Global
+using ImageEx.Cache;
 using Microsoft.UI.Composition;
 
 namespace ImageEx
@@ -46,6 +47,21 @@ namespace ImageEx
         /// Identifies the <see cref="LazyLoadingThreshold"/> dependency property.
         /// </summary>
         public static readonly DependencyProperty LazyLoadingThresholdProperty = DependencyProperty.Register(nameof(LazyLoadingThreshold), typeof(double), typeof(ImageExBase), new PropertyMetadata(default(double), LazyLoadingThresholdChanged));
+
+        /// <summary>
+        /// Identifies the <see cref="EnableDiskCache"/> dependency property.
+        /// </summary>
+        public static readonly DependencyProperty EnableDiskCacheProperty = DependencyProperty.Register(nameof(EnableDiskCache), typeof(bool), typeof(ImageExBase), new PropertyMetadata(true));
+
+        /// <summary>
+        /// Identifies the <see cref="DiskCacheDays"/> dependency property.
+        /// </summary>
+        public static readonly DependencyProperty DiskCacheDaysProperty = DependencyProperty.Register(nameof(DiskCacheDays), typeof(int), typeof(ImageExBase), new PropertyMetadata(ImageExCacheConstants.DefaultCacheDays));
+
+        /// <summary>
+        /// Identifies the <see cref="DiskCacheSizeMB"/> dependency property.
+        /// </summary>
+        public static readonly DependencyProperty DiskCacheSizeMBProperty = DependencyProperty.Register(nameof(DiskCacheSizeMB), typeof(int), typeof(ImageExBase), new PropertyMetadata(ImageExCacheConstants.DefaultCacheSizeMB));
 
         /// <summary>
         /// Returns a mask that represents the alpha channel of an image as a <see cref="CompositionBrush"/>
@@ -136,6 +152,40 @@ namespace ImageEx
         {
             get { return (double)GetValue(LazyLoadingThresholdProperty); }
             set { SetValue(LazyLoadingThresholdProperty, value); }
+        }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether disk caching is enabled.
+        /// When true (default), images are cached to local storage.
+        /// When false, uses the base memory-only caching via BitmapImage.
+        /// </summary>
+        /// <remarks>
+        /// This property only has effect when <see cref="IsCacheEnabled"/> is true.
+        /// </remarks>
+        public bool EnableDiskCache
+        {
+            get { return (bool)GetValue(EnableDiskCacheProperty); }
+            set { SetValue(EnableDiskCacheProperty, value); }
+        }
+
+        /// <summary>
+        /// Gets or sets the maximum age in days for cached images.
+        /// Images older than this will be evicted on next cleanup.
+        /// </summary>
+        public int DiskCacheDays
+        {
+            get { return (int)GetValue(DiskCacheDaysProperty); }
+            set { SetValue(DiskCacheDaysProperty, value); }
+        }
+
+        /// <summary>
+        /// Gets or sets the maximum disk cache size in megabytes.
+        /// When exceeded, least recently used images are evicted.
+        /// </summary>
+        public int DiskCacheSizeMB
+        {
+            get { return (int)GetValue(DiskCacheSizeMBProperty); }
+            set { SetValue(DiskCacheSizeMBProperty, value); }
         }
 
         private static void EnableLazyLoadingChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
