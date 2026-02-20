@@ -6,6 +6,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http;
+using ImageEx;
 using Microsoft.UI.Dispatching;
 
 namespace ImageEx.Cache;
@@ -77,7 +78,7 @@ internal sealed class ImageExCacheManager : IDisposable
         double dpiScale = 1.0)
     {
         // Skip non-http URIs - return null to let base pipeline handle
-        if (!IsHttpUri(uri))
+        if (!uri.IsHttpUri())
             return new CacheResult(null, false);
 
         var isSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase);
@@ -451,9 +452,6 @@ internal sealed class ImageExCacheManager : IDisposable
             _cleanupLock.Release();
         }
     }
-
-    private static bool IsHttpUri(Uri uri)
-        => uri.IsAbsoluteUri && (uri.Scheme == "http" || uri.Scheme == "https");
 
     public void Dispose()
     {

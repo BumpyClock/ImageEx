@@ -82,11 +82,6 @@ namespace ImageEx
             }
         }
 
-        private static bool IsHttpUri(Uri uri)
-        {
-            return uri.IsAbsoluteUri && (uri.Scheme == "http" || uri.Scheme == "https");
-        }
-
         /// <summary>
         /// Method to call to assign an <see cref="ImageSource"/> value to the underlying <see cref="Image"/> powering <see cref="ImageExBase"/>.
         /// </summary>
@@ -172,7 +167,7 @@ namespace ImageEx
                     }
                 }
                 
-                if (!IsHttpUri(uri) && !uri.IsAbsoluteUri)
+                if (!uri.IsHttpUri() && !uri.IsAbsoluteUri)
                 {
                     uri = new Uri("ms-appx:///" + uri.OriginalString.TrimStart('/'));
                 }
