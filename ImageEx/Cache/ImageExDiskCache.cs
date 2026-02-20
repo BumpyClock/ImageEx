@@ -102,7 +102,7 @@ internal sealed class ImageExDiskCache
                 try
                 {
                     var json = await File.ReadAllTextAsync(_metadataPath).ConfigureAwait(false);
-                    var data = JsonSerializer.Deserialize<Dictionary<string, CacheEntry>>(json);
+                    var data = JsonSerializer.Deserialize(json, ImageExCacheJsonContext.Default.DictionaryStringCacheEntry);
                     if (data != null)
                     {
                         foreach (var kvp in data)
@@ -174,7 +174,7 @@ internal sealed class ImageExDiskCache
         {
             Directory.CreateDirectory(_cacheDir);
             var snapshot = _metadata.ToDictionary(k => k.Key, v => v.Value);
-            var json = JsonSerializer.Serialize(snapshot, new JsonSerializerOptions { WriteIndented = false });
+            var json = JsonSerializer.Serialize(snapshot, ImageExCacheJsonContext.Default.DictionaryStringCacheEntry);
             await File.WriteAllTextAsync(_metadataPath, json).ConfigureAwait(false);
         }
         finally
