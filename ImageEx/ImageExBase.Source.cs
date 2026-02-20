@@ -29,6 +29,36 @@ namespace ImageEx
             set { SetValue(SourceProperty, value); }
         }
 
+        private void OnImageExUnloaded(object sender, RoutedEventArgs e)
+        {
+            CleanupTokenSource();
+        }
+
+        private void CleanupTokenSource()
+        {
+            var tokenSource = _tokenSource;
+            _tokenSource = null;
+            
+            if (tokenSource != null)
+            {
+                try
+                {
+                    if (!tokenSource.Token.IsCancellationRequested)
+                    {
+                        tokenSource.Cancel();
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Already disposed, ignore
+                }
+                finally
+                {
+                    tokenSource.Dispose();
+                }
+            }
+        }
+
         private static void SourceChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
         {
             var control = d as ImageExBase;
@@ -88,55 +118,70 @@ namespace ImageEx
 
         private async void SetSource(object source)
         {
-            if (!IsInitialized)
-            {
-                return;
-            }
-            
-            if (_tokenSource is { Token.IsCancellationRequested: false })
-                await _tokenSource?.CancelAsync()!;
-
-            _tokenSource = new CancellationTokenSource();
-
-            AttachSource(null);
-
-            if (source == null)
-            {
-                return;
-            }
-
-            VisualStateManager.GoToState(this, LoadingState, true);
-            var imageSource = source as ImageSource;
-            if (imageSource != null)
-            {
-                AttachSource(imageSource);
-
-                return;
-            }
-            var uri = source as Uri;
-            if (uri == null)
-            {
-                var url = source as string ?? source.ToString();
-                if (!Uri.TryCreate(url, UriKind.RelativeOrAbsolute, out uri))
-                {
-                    VisualStateManager.GoToState(this, FailedState, true);
-                    ImageExFailed?.Invoke(this, new ImageExFailedEventArgs(new UriFormatException("Invalid uri specified.")));
-                    return;
-                }
-            }
-            
-            if (!IsHttpUri(uri) && !uri.IsAbsoluteUri)
-            {
-                uri = new Uri("ms-appx:///" + uri.OriginalString.TrimStart('/'));
-            }
-            
             try
             {
-                await LoadImageAsync(uri, _tokenSource.Token);
+                if (!IsInitialized)
+                {
+                    return;
+                }
+                
+                CancellationTokenSource oldTokenSource = null;
+                
+                if (_tokenSource != null)
+                {
+                    oldTokenSource = _tokenSource;
+                    _tokenSource = null;
+                }
+
+                var newTokenSource = new CancellationTokenSource();
+                _tokenSource = newTokenSource;
+
+                if (oldTokenSource != null)
+                {
+                    if (!oldTokenSource.Token.IsCancellationRequested)
+                    {
+                        await oldTokenSource.CancelAsync();
+                    }
+                    oldTokenSource.Dispose();
+                }
+
+                AttachSource(null);
+
+                if (source == null)
+                {
+                    return;
+                }
+
+                VisualStateManager.GoToState(this, LoadingState, true);
+                var imageSource = source as ImageSource;
+                if (imageSource != null)
+                {
+                    AttachSource(imageSource);
+
+                    return;
+                }
+                var uri = source as Uri;
+                if (uri == null)
+                {
+                    var url = source as string ?? source.ToString();
+                    if (!Uri.TryCreate(url, UriKind.RelativeOrAbsolute, out uri))
+                    {
+                        VisualStateManager.GoToState(this, FailedState, true);
+                        ImageExFailed?.Invoke(this, new ImageExFailedEventArgs(new UriFormatException("Invalid uri specified")));
+                        return;
+                    }
+                }
+                
+                if (!IsHttpUri(uri) && !uri.IsAbsoluteUri)
+                {
+                    uri = new Uri("ms-appx:///" + uri.OriginalString.TrimStart('/'));
+                }
+                
+                await LoadImageAsync(uri, newTokenSource.Token);
             }
             catch (OperationCanceledException)
             {
-                // nothing to do as cancellation has been requested.
+                // Nothing to do as cancellation has been requested
             }
             catch (Exception e)
             {
@@ -153,9 +198,9 @@ namespace ImageEx
                 {
                     var img = await ProvideCachedResourceAsync(imageUri, token);
 
-                    if (!_tokenSource.IsCancellationRequested)
+                    if (_tokenSource != null && !_tokenSource.IsCancellationRequested)
                     {
-                        // Only attach our image if we still have a valid request.
+                        // Only attach our image if we still have a valid request
                         AttachSource(img);
                     }
                 }
@@ -170,7 +215,7 @@ namespace ImageEx
                         var bitmap = new BitmapImage();
                         await bitmap.SetSourceAsync(new MemoryStream(bytes).AsRandomAccessStream());
 
-                        if (!_tokenSource.IsCancellationRequested)
+                        if (_tokenSource != null && !_tokenSource.IsCancellationRequested)
                         {
                             AttachSource(bitmap);
                         }

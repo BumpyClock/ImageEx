@@ -48,13 +48,17 @@ namespace ImageEx
             manager.MaxCacheDays = DiskCacheDays;
             manager.MaxCacheSizeBytes = DiskCacheSizeMB * 1024L * 1024L;
 
+            // Get DPI scale for adaptive decode sizing (defaults to 1.0 if XamlRoot not available)
+            var dpiScale = XamlRoot?.RasterizationScale ?? 1.0;
+
             var result = await manager.GetOrLoadImageAsync(
                 imageUri,
                 DecodePixelWidth,
                 DecodePixelHeight,
                 DecodePixelType,
                 token,
-                DispatcherQueue);
+                DispatcherQueue,
+                dpiScale);
 
             // Skip shimmer animation on cache hit by jumping directly to Loaded state
             if (result.WasCacheHit && result.Image != null)

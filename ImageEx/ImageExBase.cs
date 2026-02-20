@@ -178,6 +178,8 @@ namespace ImageEx
 
             AttachImageOpened(OnImageOpened);
             AttachImageFailed(OnImageFailed);
+            
+            Unloaded += OnImageExUnloaded;
 
             base.OnApplyTemplate();
         }

@@ -63,6 +63,8 @@ internal sealed class ImageExCacheManager
     /// <param name="decodeHeight">Decode pixel height.</param>
     /// <param name="decodeType">Decode pixel type.</param>
     /// <param name="token">Cancellation token.</param>
+    /// <param name="dispatcherQueue">Optional dispatcher queue for UI thread marshaling.</param>
+    /// <param name="dpiScale">Optional DPI scale factor (e.g., 1.0, 1.5, 2.0) for adaptive fallback sizing.</param>
     /// <returns>CacheResult with the image and cache hit status.</returns>
     public async Task<CacheResult> GetOrLoadImageAsync(
         Uri uri,
@@ -70,7 +72,8 @@ internal sealed class ImageExCacheManager
         int decodeHeight,
         DecodePixelType decodeType,
         CancellationToken token,
-        DispatcherQueue? dispatcherQueue = null)
+        DispatcherQueue? dispatcherQueue = null,
+        double dpiScale = 1.0)
     {
         // Skip non-http URIs - return null to let base pipeline handle
         if (!IsHttpUri(uri))
@@ -93,7 +96,7 @@ internal sealed class ImageExCacheManager
                 {
                     token.ThrowIfCancellationRequested();
                     var cachedIsSvg = entry.Extension == ".svg";
-                    var image = await LoadFromFileAsync(filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, token, dispatcherQueue).ConfigureAwait(false);
+                    var image = await LoadFromFileAsync(filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, token, dispatcherQueue, dpiScale).ConfigureAwait(false);
 
                     if (image != null)
                     {
@@ -192,24 +195,63 @@ internal sealed class ImageExCacheManager
         }
 
         // 4. Return image from downloaded bytes
-        var loadedImage = await LoadFromBytesAsync(result.bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue).ConfigureAwait(false);
+        var loadedImage = await LoadFromBytesAsync(result.bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale).ConfigureAwait(false);
         return new CacheResult(loadedImage, WasCacheHit: false);
     }
 
     private async Task<(byte[]? bytes, string? contentType)> DownloadAsync(Uri uri, CancellationToken token)
     {
-        try
+        const int maxAttempts = 3;
+        const int baseDelayMs = 200;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            using var response = await _httpClient.GetAsync(uri, token).ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
-            var contentType = response.Content.Headers.ContentType?.MediaType;
-            var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
-            return (bytes, contentType);
+            try
+            {
+                using var response = await _httpClient.GetAsync(uri, token).ConfigureAwait(false);
+                response.EnsureSuccessStatusCode();
+                var contentType = response.Content.Headers.ContentType?.MediaType;
+                var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+                return (bytes, contentType);
+            }
+            catch (HttpRequestException ex) when (IsTransientError(ex) && attempt < maxAttempts - 1)
+            {
+                var delayMs = baseDelayMs * (1 << attempt); // Exponential: 200ms, 400ms, 800ms
+                await Task.Delay(delayMs, token).ConfigureAwait(false);
+            }
+            catch (TaskCanceledException) when (!token.IsCancellationRequested && attempt < maxAttempts - 1)
+            {
+                // Timeout (not user-requested cancellation)
+                var delayMs = baseDelayMs * (1 << attempt);
+                await Task.Delay(delayMs, token).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Permanent failure or last attempt - bail out
+                return (null, null);
+            }
         }
-        catch
+
+        return (null, null);
+    }
+
+    private static bool IsTransientError(HttpRequestException ex)
+    {
+        var statusCode = ex.StatusCode;
+        if (statusCode == null) return true; // Network errors without status code
+
+        // Retry transient errors
+        return statusCode switch
         {
-            return (null, null);
-        }
+            System.Net.HttpStatusCode.RequestTimeout or       // 408
+            System.Net.HttpStatusCode.TooManyRequests or      // 429
+            System.Net.HttpStatusCode.InternalServerError or  // 500
+            System.Net.HttpStatusCode.BadGateway or           // 502
+            System.Net.HttpStatusCode.ServiceUnavailable or   // 503
+            System.Net.HttpStatusCode.GatewayTimeout          // 504
+                => true,
+            _ => false
+        };
     }
 
     private static async Task<ImageSource?> LoadFromFileAsync(
@@ -219,7 +261,8 @@ internal sealed class ImageExCacheManager
         int decodeHeight,
         DecodePixelType decodeType,
         CancellationToken token = default,
-        DispatcherQueue? dispatcherQueue = null)
+        DispatcherQueue? dispatcherQueue = null,
+        double dpiScale = 1.0)
     {
         token.ThrowIfCancellationRequested();
         try
@@ -236,7 +279,7 @@ internal sealed class ImageExCacheManager
                 return null;
             }
 
-            return await LoadFromBytesAsync(bytes, isSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue).ConfigureAwait(false);
+            return await LoadFromBytesAsync(bytes, isSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -255,7 +298,8 @@ internal sealed class ImageExCacheManager
         int decodeWidth,
         int decodeHeight,
         DecodePixelType decodeType,
-        DispatcherQueue? dispatcherQueue = null)
+        DispatcherQueue? dispatcherQueue = null,
+        double dpiScale = 1.0)
     {
         return await RunOnDispatcherAsync(dispatcherQueue, async () =>
         {
@@ -270,10 +314,17 @@ internal sealed class ImageExCacheManager
             var targetWidth = decodeWidth;
             var targetHeight = decodeHeight;
 
-            // If no decode hint was provided, pick a sane default to avoid full-res decode bloat.
+            // VISUAL QUALITY & MEMORY TARGET:
+            // When no explicit decode size is provided, use a DPI-aware fallback to balance quality and memory.
+            // Base size of 400px @ 1x DPI provides good quality for typical UI scenarios (feed images, thumbnails).
+            // Scales linearly with DPI: 1.0x=400px, 1.5x=600px, 2.0x=800px, 3.0x=1200px.
+            // This avoids both full-resolution memory bloat and visible pixelation on high-DPI displays.
+            // For precise control over decode size, callers should set DecodePixelWidth/Height on the ImageEx control.
             if (targetWidth <= 0 && targetHeight <= 0)
             {
-                targetWidth = 512;
+                // Clamp DPI scale to reasonable bounds (0.5x - 4.0x) to prevent extreme decode sizes.
+                var clampedDpiScale = Math.Max(0.5, Math.Min(4.0, dpiScale));
+                targetWidth = (int)Math.Round(400 * clampedDpiScale);
             }
 
             var bitmap = new BitmapImage
