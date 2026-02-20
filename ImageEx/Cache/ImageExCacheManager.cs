@@ -19,7 +19,7 @@ namespace ImageEx.Cache;
 /// This is a static singleton and is typically kept for app lifetime.
 /// It still implements <see cref="IDisposable"/> so tests or explicit host shutdown can flush/tear down resources deterministically.
 /// </remarks>
-internal sealed class ImageExCacheManager : IDisposable
+internal sealed partial class ImageExCacheManager : IDisposable
 {
     /// <summary>
     /// Singleton instance.
@@ -98,7 +98,7 @@ internal sealed class ImageExCacheManager : IDisposable
                 {
                     token.ThrowIfCancellationRequested();
                     var cachedIsSvg = entry.Extension == ".svg";
-                    var image = await LoadFromFileAsync(filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, token, dispatcherQueue, dpiScale).ConfigureAwait(false);
+                    var image = await LoadFromFileAsync(filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token).ConfigureAwait(false);
 
                     if (image != null)
                     {
@@ -262,9 +262,9 @@ internal sealed class ImageExCacheManager : IDisposable
         int decodeWidth,
         int decodeHeight,
         DecodePixelType decodeType,
-        CancellationToken token = default,
         DispatcherQueue? dispatcherQueue = null,
-        double dpiScale = 1.0)
+        double dpiScale = 1.0,
+        CancellationToken token = default)
     {
         token.ThrowIfCancellationRequested();
         try
