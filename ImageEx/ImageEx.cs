@@ -3,6 +3,7 @@
 // See the LICENSE file in the project root for more information.
 
 using ImageEx.Cache;
+using Microsoft.UI.Dispatching;
 
 namespace ImageEx
 {
@@ -52,7 +53,8 @@ namespace ImageEx
                 DecodePixelWidth,
                 DecodePixelHeight,
                 DecodePixelType,
-                token);
+                token,
+                DispatcherQueue);
 
             // Skip shimmer animation on cache hit by jumping directly to Loaded state
             if (result.WasCacheHit && result.Image != null)

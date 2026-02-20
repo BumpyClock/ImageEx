@@ -6,6 +6,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http;
+using Microsoft.UI.Dispatching;
 
 namespace ImageEx.Cache;
 
@@ -68,7 +69,8 @@ internal sealed class ImageExCacheManager
         int decodeWidth,
         int decodeHeight,
         DecodePixelType decodeType,
-        CancellationToken token)
+        CancellationToken token,
+        DispatcherQueue? dispatcherQueue = null)
     {
         // Skip non-http URIs - return null to let base pipeline handle
         if (!IsHttpUri(uri))
@@ -91,7 +93,7 @@ internal sealed class ImageExCacheManager
                 {
                     token.ThrowIfCancellationRequested();
                     var cachedIsSvg = entry.Extension == ".svg";
-                    var image = await LoadFromFileAsync(filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, token).ConfigureAwait(false);
+                    var image = await LoadFromFileAsync(filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, token, dispatcherQueue).ConfigureAwait(false);
 
                     if (image != null)
                     {
@@ -104,6 +106,12 @@ internal sealed class ImageExCacheManager
                         });
 
                         return new CacheResult(image, WasCacheHit: true);
+                    }
+                    else
+                    {
+                        // Cached file failed to decode; remove and re-download.
+                        _diskCache.TryDeleteFile(filePath);
+                        _diskCache.RemoveEntry(cacheKey);
                     }
                 }
                 catch (OperationCanceledException)
@@ -184,7 +192,7 @@ internal sealed class ImageExCacheManager
         }
 
         // 4. Return image from downloaded bytes
-        var loadedImage = await LoadFromBytesAsync(result.bytes, detectedSvg, decodeWidth, decodeHeight, decodeType).ConfigureAwait(false);
+        var loadedImage = await LoadFromBytesAsync(result.bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue).ConfigureAwait(false);
         return new CacheResult(loadedImage, WasCacheHit: false);
     }
 
@@ -210,11 +218,35 @@ internal sealed class ImageExCacheManager
         int decodeWidth,
         int decodeHeight,
         DecodePixelType decodeType,
-        CancellationToken token = default)
+        CancellationToken token = default,
+        DispatcherQueue? dispatcherQueue = null)
     {
         token.ThrowIfCancellationRequested();
-        await using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, useAsync: true);
-        return await LoadFromStreamAsync(stream, isSvg, decodeWidth, decodeHeight, decodeType).ConfigureAwait(false);
+        try
+        {
+            var fileInfo = new FileInfo(filePath);
+            if (!fileInfo.Exists || fileInfo.Length == 0)
+            {
+                return null;
+            }
+
+            var bytes = await File.ReadAllBytesAsync(filePath, token).ConfigureAwait(false);
+            if (bytes.Length == 0)
+            {
+                return null;
+            }
+
+            return await LoadFromBytesAsync(bytes, isSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[ImageExCache] Failed to decode cached file {filePath}: {ex.Message}");
+            return null;
+        }
     }
 
     private static async Task<ImageSource?> LoadFromBytesAsync(
@@ -222,47 +254,82 @@ internal sealed class ImageExCacheManager
         bool isSvg,
         int decodeWidth,
         int decodeHeight,
-        DecodePixelType decodeType)
+        DecodePixelType decodeType,
+        DispatcherQueue? dispatcherQueue = null)
     {
-        using var stream = new MemoryStream(bytes);
-        return await LoadFromStreamAsync(stream, isSvg, decodeWidth, decodeHeight, decodeType).ConfigureAwait(false);
-    }
-
-        private static async Task<ImageSource?> LoadFromStreamAsync(
-        Stream stream,
-        bool isSvg,
-        int decodeWidth,
-        int decodeHeight,
-        DecodePixelType decodeType)
+        return await RunOnDispatcherAsync(dispatcherQueue, async () =>
         {
             if (isSvg)
             {
                 var svg = new SvgImageSource();
-                await svg.SetSourceAsync(stream.AsRandomAccessStream());
-                return svg;
+                using var svgStream = new MemoryStream(bytes);
+                await svg.SetSourceAsync(svgStream.AsRandomAccessStream());
+                return (ImageSource?)svg;
             }
 
-        var targetWidth = decodeWidth;
-        var targetHeight = decodeHeight;
+            var targetWidth = decodeWidth;
+            var targetHeight = decodeHeight;
 
-        // If no decode hint was provided, pick a sane default to avoid full-res decode bloat.
-        if (targetWidth <= 0 && targetHeight <= 0)
+            // If no decode hint was provided, pick a sane default to avoid full-res decode bloat.
+            if (targetWidth <= 0 && targetHeight <= 0)
+            {
+                targetWidth = 512;
+            }
+
+            var bitmap = new BitmapImage
+            {
+                DecodePixelType = decodeType,
+                CreateOptions = BitmapCreateOptions.IgnoreImageCache
+            };
+
+            if (targetWidth > 0) bitmap.DecodePixelWidth = targetWidth;
+            if (targetHeight > 0) bitmap.DecodePixelHeight = targetHeight;
+
+            using var bitmapStream = new MemoryStream(bytes);
+            await bitmap.SetSourceAsync(bitmapStream.AsRandomAccessStream());
+            return (ImageSource?)bitmap;
+        }).ConfigureAwait(false);
+    }
+    private static Task<T?> RunOnDispatcherAsync<T>(DispatcherQueue? dispatcherQueue, Func<Task<T?>> factory)
+    {
+        if (dispatcherQueue == null || dispatcherQueue.HasThreadAccess)
         {
-            targetWidth = 512;
+            return SafeFactoryCall(factory);
         }
 
-        var bitmap = new BitmapImage
+        var tcs = new TaskCompletionSource<T?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!dispatcherQueue.TryEnqueue(async () =>
+            {
+                try
+                {
+                    var result = await factory().ConfigureAwait(false);
+                    tcs.TrySetResult(result);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[ImageExCache] Failed to create image on UI thread: {ex.Message}");
+                    tcs.TrySetResult(default);
+                }
+            }))
         {
-            DecodePixelType = decodeType,
-            CreateOptions = BitmapCreateOptions.IgnoreImageCache
-        };
-
-        if (targetWidth > 0) bitmap.DecodePixelWidth = targetWidth;
-        if (targetHeight > 0) bitmap.DecodePixelHeight = targetHeight;
-
-        await bitmap.SetSourceAsync(stream.AsRandomAccessStream());
-        return bitmap;
+            tcs.TrySetResult(default);
         }
+
+        return tcs.Task;
+    }
+
+    private static async Task<T?> SafeFactoryCall<T>(Func<Task<T?>> factory)
+    {
+        try
+        {
+            return await factory().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[ImageExCache] Failed to decode image: {ex.Message}");
+            return default;
+        }
+    }
 
     private async Task EnforceCleanupIfNeededAsync()
     {
