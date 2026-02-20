@@ -88,20 +88,27 @@ namespace ImageEx
         // ReSharper disable once PublicConstructorInAbstractClass
         public ImageExBase() { }
 
+        private void ModifyImageHandler(Action<Image> imageHandlerUpdate, Action<ImageBrush> brushHandlerUpdate)
+        {
+            if (Image is Image image)
+            {
+                imageHandlerUpdate(image);
+            }
+            else if (Image is ImageBrush brush)
+            {
+                brushHandlerUpdate(brush);
+            }
+        }
+
         /// <summary>
         /// Attach image opened event handler
         /// </summary>
         /// <param name="handler">Routed Event Handler</param>
         protected void AttachImageOpened(RoutedEventHandler handler)
         {
-            if (Image is Image image)
-            {
-                image.ImageOpened += handler;
-            }
-            else if (Image is ImageBrush brush)
-            {
-                brush.ImageOpened += handler;
-            }
+            ModifyImageHandler(
+                image => image.ImageOpened += handler,
+                brush => brush.ImageOpened += handler);
         }
 
         /// <summary>
@@ -110,14 +117,9 @@ namespace ImageEx
         /// <param name="handler">RoutedEventHandler</param>
         protected void RemoveImageOpened(RoutedEventHandler handler)
         {
-            if (Image is Image image)
-            {
-                image.ImageOpened -= handler;
-            }
-            else if (Image is ImageBrush brush)
-            {
-                brush.ImageOpened -= handler;
-            }
+            ModifyImageHandler(
+                image => image.ImageOpened -= handler,
+                brush => brush.ImageOpened -= handler);
         }
 
         /// <summary>
@@ -126,14 +128,9 @@ namespace ImageEx
         /// <param name="handler">Exception Routed Event Handler</param>
         protected void AttachImageFailed(ExceptionRoutedEventHandler handler)
         {
-            if (Image is Image image)
-            {
-                image.ImageFailed += handler;
-            }
-            else if (Image is ImageBrush brush)
-            {
-                brush.ImageFailed += handler;
-            }
+            ModifyImageHandler(
+                image => image.ImageFailed += handler,
+                brush => brush.ImageFailed += handler);
         }
 
         /// <summary>
@@ -142,14 +139,9 @@ namespace ImageEx
         /// <param name="handler">Exception Routed Event Handler</param>
         protected void RemoveImageFailed(ExceptionRoutedEventHandler handler)
         {
-            if (Image is Image image)
-            {
-                image.ImageFailed -= handler;
-            }
-            else if (Image is ImageBrush brush)
-            {
-                brush.ImageFailed -= handler;
-            }
+            ModifyImageHandler(
+                image => image.ImageFailed -= handler,
+                brush => brush.ImageFailed -= handler);
         }
 
         /// <summary>

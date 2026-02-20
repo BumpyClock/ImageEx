@@ -16,8 +16,8 @@ namespace ImageEx.Cache;
 /// in-flight deduplication, and cleanup orchestration.
 /// </summary>
 /// <remarks>
-/// This is a static singleton - HttpClient is kept alive for app lifetime.
-/// No IDisposable needed as resources are managed for the app's duration.
+/// This is a static singleton and is typically kept for app lifetime.
+/// It still implements <see cref="IDisposable"/> so tests or explicit host shutdown can flush/tear down resources deterministically.
 /// </remarks>
 internal sealed class ImageExCacheManager : IDisposable
 {
