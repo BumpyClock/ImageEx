@@ -18,7 +18,7 @@ namespace ImageEx.Cache;
 /// This is a static singleton - HttpClient is kept alive for app lifetime.
 /// No IDisposable needed as resources are managed for the app's duration.
 /// </remarks>
-internal sealed class ImageExCacheManager
+internal sealed class ImageExCacheManager : IDisposable
 {
     /// <summary>
     /// Singleton instance.
@@ -31,6 +31,7 @@ internal sealed class ImageExCacheManager
     private readonly SemaphoreSlim _cleanupLock = new(1, 1);
     private DateTimeOffset _lastCleanup = DateTimeOffset.MinValue;
     private bool _initialSizeScanned;
+    private bool _disposed;
 
     /// <summary>
     /// Maximum cache age in days (configurable via DP).
@@ -453,4 +454,17 @@ internal sealed class ImageExCacheManager
 
     private static bool IsHttpUri(Uri uri)
         => uri.IsAbsoluteUri && (uri.Scheme == "http" || uri.Scheme == "https");
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _httpClient.Dispose();
+        _cleanupLock.Dispose();
+        GC.SuppressFinalize(this);
+    }
 }
