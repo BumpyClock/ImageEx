@@ -5,7 +5,6 @@
         <Platforms>x86;x64;ARM64</Platforms>
         <TargetFramework>net9.0-windows10.0.22621.0</TargetFramework>
         <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
-        <RuntimeIdentifiers>win-x86;win-x64;win-arm64</RuntimeIdentifiers>
         <EnableWindowsTargeting>true</EnableWindowsTargeting>
         <OutputType>Library</OutputType>
         <LangVersion>12.0</LangVersion>
