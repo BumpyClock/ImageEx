@@ -77,6 +77,8 @@ internal sealed partial class ImageExCacheManager : IDisposable
         DispatcherQueue? dispatcherQueue = null,
         double dpiScale = 1.0)
     {
+        token.ThrowIfCancellationRequested();
+
         // Skip non-http URIs - return null to let base pipeline handle
         if (!uri.IsHttpUri())
             return new CacheResult(null, false);
