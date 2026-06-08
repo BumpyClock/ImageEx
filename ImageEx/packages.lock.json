@@ -18,6 +18,12 @@
           "Microsoft.WindowsAppSDK": "1.6.250108002"
         }
       },
+      "Microsoft.DotNet.ILCompiler": {
+        "type": "Direct",
+        "requested": "[9.0.16, )",
+        "resolved": "9.0.16",
+        "contentHash": "gnotcG8+hrKBRsrphcux0clXksJmwE5IaPRXd8syG/56GX3iSxdcKnl1Cx23jB7bcxaoxHWyJevtJBAIBqdCCg=="
+      },
       "Microsoft.NET.ILLink.Tasks": {
         "type": "Direct",
         "requested": "[9.0.16, )",
