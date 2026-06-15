@@ -28,8 +28,11 @@ internal sealed partial class ImageExCacheManager : IDisposable
 
     private readonly ImageExDiskCache _diskCache;
     private readonly HttpClient _httpClient;
-    private readonly ConcurrentDictionary<string, Task<(byte[]? Bytes, string? ContentType)>> _inFlightDownloads = new();
+    private readonly ConcurrentDictionary<string, Lazy<SharedDownload>> _inFlightDownloads = new();
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _cacheWriteLocks = new();
     private readonly SemaphoreSlim _cleanupLock = new(1, 1);
+    private readonly SemaphoreSlim _downloadConcurrency;
+    private readonly SemaphoreSlim _decodeConcurrency;
     private DateTimeOffset _lastCleanup = DateTimeOffset.MinValue;
     private bool _initialSizeScanned;
     private bool _disposed;
@@ -45,9 +48,24 @@ internal sealed partial class ImageExCacheManager : IDisposable
     public long MaxCacheSizeBytes { get; set; } = ImageExCacheConstants.DefaultCacheSizeBytes;
 
     private ImageExCacheManager()
+        : this(ImageExCacheConstants.GetCacheDirectory())
     {
-        _diskCache = new ImageExDiskCache(ImageExCacheConstants.GetCacheDirectory());
-        _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+    }
+
+    internal ImageExCacheManager(
+        string cacheDirectory,
+        HttpMessageHandler? httpMessageHandler = null,
+        int maxConcurrentDownloads = 4,
+        int maxConcurrentDecodes = 4)
+    {
+        _diskCache = new ImageExDiskCache(cacheDirectory);
+        _httpClient = httpMessageHandler == null
+            ? new HttpClient { Timeout = TimeSpan.FromSeconds(30) }
+            : new HttpClient(httpMessageHandler) { Timeout = TimeSpan.FromSeconds(30) };
+        maxConcurrentDownloads = Math.Max(1, maxConcurrentDownloads);
+        maxConcurrentDecodes = Math.Max(1, maxConcurrentDecodes);
+        _downloadConcurrency = new SemaphoreSlim(maxConcurrentDownloads, maxConcurrentDownloads);
+        _decodeConcurrency = new SemaphoreSlim(maxConcurrentDecodes, maxConcurrentDecodes);
     }
 
     /// <summary>
@@ -56,6 +74,72 @@ internal sealed partial class ImageExCacheManager : IDisposable
     /// <param name="Image">The loaded ImageSource, or null on failure.</param>
     /// <param name="WasCacheHit">True if served from disk cache (skip shimmer).</param>
     public record CacheResult(ImageSource? Image, bool WasCacheHit);
+
+    private readonly record struct DownloadResult(byte[]? Bytes, string? ContentType);
+
+    private sealed class SharedDownload : IDisposable
+    {
+        private readonly object _gate = new();
+        private readonly CancellationTokenSource _cancellation = new();
+        private int _waiterCount;
+        private bool _cancelledForNoWaiters;
+
+        public SharedDownload(Func<CancellationToken, Task<DownloadResult>> startDownload)
+        {
+            Task = startDownload(_cancellation.Token);
+        }
+
+        public Task<DownloadResult> Task { get; }
+
+        public bool TryAddWaiter()
+        {
+            lock (_gate)
+            {
+                if (_cancelledForNoWaiters)
+                {
+                    return false;
+                }
+
+                _waiterCount++;
+                return true;
+            }
+        }
+
+        public bool ReleaseWaiterShouldCancel()
+        {
+            lock (_gate)
+            {
+                _waiterCount--;
+                if (_waiterCount == 0 && !Task.IsCompleted)
+                {
+                    _cancelledForNoWaiters = true;
+                    return true;
+                }
+
+                return false;
+            }
+        }
+
+        public void Cancel()
+        {
+            try
+            {
+                _cancellation.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Completion can dispose the shared CTS between last-waiter release and cancel.
+            }
+        }
+
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                _cancellation.Dispose();
+            }
+        }
+    }
 
     /// <summary>
     /// Gets an image from cache or downloads it, with in-flight deduplication.
@@ -75,16 +159,20 @@ internal sealed partial class ImageExCacheManager : IDisposable
         DecodePixelType decodeType,
         CancellationToken token,
         DispatcherQueue? dispatcherQueue = null,
-        double dpiScale = 1.0)
+        double dpiScale = 1.0,
+        bool returnNullOnCancellation = false)
     {
-        token.ThrowIfCancellationRequested();
+        if (token.IsCancellationRequested)
+        {
+            return CancelledResult(token, returnNullOnCancellation);
+        }
 
         // Skip non-http URIs - return null to let base pipeline handle
         if (!uri.IsHttpUri())
             return new CacheResult(null, false);
 
         var isSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase);
-        var cacheKey = ImageExDiskCache.ComputeCacheKey(uri, decodeWidth, decodeHeight, decodeType, isSvg);
+        var cacheKey = ImageExDiskCache.ComputeSourceCacheKey(uri);
 
         await _diskCache.EnsureMetadataLoadedAsync().ConfigureAwait(false);
 
@@ -98,9 +186,13 @@ internal sealed partial class ImageExCacheManager : IDisposable
             {
                 try
                 {
-                    token.ThrowIfCancellationRequested();
+                    if (token.IsCancellationRequested)
+                    {
+                        return CancelledResult(token, returnNullOnCancellation);
+                    }
+
                     var cachedIsSvg = entry.Extension == ".svg";
-                    var image = await LoadFromFileAsync(filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token).ConfigureAwait(false);
+                    var image = await LoadFromFileAsync(filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
 
                     if (image != null)
                     {
@@ -121,9 +213,13 @@ internal sealed partial class ImageExCacheManager : IDisposable
                         _diskCache.RemoveEntry(cacheKey);
                     }
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException) when (!returnNullOnCancellation)
                 {
                     throw;
+                }
+                catch (OperationCanceledException)
+                {
+                    return new CacheResult(null, false);
                 }
                 catch
                 {
@@ -142,41 +238,25 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
 
         // 2. Download with in-flight deduplication
-        var downloadTask = _inFlightDownloads.GetOrAdd(cacheKey, _ => DownloadAsync(uri, token));
+        var result = await AwaitSharedDownloadAsync(cacheKey, uri, token, returnNullOnCancellation).ConfigureAwait(false);
 
-        (byte[]? bytes, string? contentType) result;
-        try
-        {
-            result = await downloadTask.ConfigureAwait(false);
-        }
-        finally
-        {
-            _inFlightDownloads.TryRemove(cacheKey, out _);
-        }
-
-        if (result.bytes == null || token.IsCancellationRequested)
+        if (result.Bytes == null || token.IsCancellationRequested)
             return new CacheResult(null, false);
 
         // Detect SVG from content-type if URL didn't have .svg extension
-        var detectedSvg = isSvg || result.contentType == "image/svg+xml";
-        var extension = ImageExDiskCache.GetExtension(uri, result.contentType, detectedSvg);
+        var detectedSvg = isSvg || result.ContentType == "image/svg+xml";
+        var extension = ImageExDiskCache.GetExtension(uri, result.ContentType, detectedSvg);
         var newFilePath = _diskCache.GetFilePath(cacheKey, extension);
 
         // 3. Save to disk
         try
         {
-            token.ThrowIfCancellationRequested();
-            Directory.CreateDirectory(ImageExCacheConstants.GetCacheDirectory());
-            await File.WriteAllBytesAsync(newFilePath, result.bytes, token).ConfigureAwait(false);
-
-            _diskCache.AddOrUpdateEntry(cacheKey, new CacheEntry
+            if (token.IsCancellationRequested)
             {
-                Url = uri.OriginalString,
-                Extension = extension,
-                DownloadedUtc = DateTimeOffset.UtcNow,
-                LastAccessUtc = DateTimeOffset.UtcNow,
-                SizeBytes = result.bytes.Length
-            });
+                return CancelledResult(token, returnNullOnCancellation);
+            }
+
+            await SaveDownloadedFileAsync(cacheKey, uri, newFilePath, extension, result.Bytes, token, returnNullOnCancellation).ConfigureAwait(false);
 
             // Fire-and-forget: persist metadata + cleanup check
             _ = Task.Run(async () =>
@@ -189,9 +269,13 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 catch { /* Best effort */ }
             });
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!returnNullOnCancellation)
         {
             throw;
+        }
+        catch (OperationCanceledException)
+        {
+            return new CacheResult(null, false);
         }
         catch
         {
@@ -199,44 +283,211 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
 
         // 4. Return image from downloaded bytes
-        var loadedImage = await LoadFromBytesAsync(result.bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale).ConfigureAwait(false);
+        var loadedImage = await LoadFromBytesAsync(result.Bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
         return new CacheResult(loadedImage, WasCacheHit: false);
     }
 
-    private async Task<(byte[]? bytes, string? contentType)> DownloadAsync(Uri uri, CancellationToken token)
+    private static CacheResult CancelledResult(CancellationToken token, bool returnNullOnCancellation)
+    {
+        if (returnNullOnCancellation)
+        {
+            return new CacheResult(null, false);
+        }
+
+        token.ThrowIfCancellationRequested();
+        return new CacheResult(null, false);
+    }
+
+    private async Task<DownloadResult> AwaitSharedDownloadAsync(
+        string cacheKey,
+        Uri uri,
+        CancellationToken token,
+        bool returnNullOnCancellation)
+    {
+        while (true)
+        {
+            var lazyDownload = _inFlightDownloads.GetOrAdd(cacheKey, _ => CreateSharedDownloadLazy(cacheKey, uri));
+            var sharedDownload = lazyDownload.Value;
+
+            if (!sharedDownload.TryAddWaiter())
+            {
+                RemoveSharedDownload(cacheKey, lazyDownload);
+                continue;
+            }
+
+            try
+            {
+                if (returnNullOnCancellation)
+                {
+                    var result = await WaitForDownloadOrCancellationAsync(sharedDownload.Task, token).ConfigureAwait(false);
+                    return result ?? new DownloadResult(null, null);
+                }
+
+                return await sharedDownload.Task.WaitAsync(token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (returnNullOnCancellation)
+            {
+                return new DownloadResult(null, null);
+            }
+            finally
+            {
+                if (sharedDownload.ReleaseWaiterShouldCancel())
+                {
+                    RemoveSharedDownload(cacheKey, lazyDownload);
+                    sharedDownload.Cancel();
+                }
+            }
+        }
+    }
+
+    private static async Task<DownloadResult?> WaitForDownloadOrCancellationAsync(
+        Task<DownloadResult> downloadTask,
+        CancellationToken token)
+    {
+        if (downloadTask.IsCompleted || !token.CanBeCanceled)
+        {
+            return await downloadTask.ConfigureAwait(false);
+        }
+
+        if (token.IsCancellationRequested)
+        {
+            return null;
+        }
+
+        var cancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, token);
+        var completedTask = await Task.WhenAny(downloadTask, cancellationTask).ConfigureAwait(false);
+        if (completedTask != downloadTask)
+        {
+            return null;
+        }
+
+        return await downloadTask.ConfigureAwait(false);
+    }
+
+    private Lazy<SharedDownload> CreateSharedDownloadLazy(string cacheKey, Uri uri)
+    {
+        Lazy<SharedDownload>? lazyDownload = null;
+        lazyDownload = new Lazy<SharedDownload>(
+            () => StartSharedDownload(cacheKey, uri, lazyDownload),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+        return lazyDownload;
+    }
+
+    private SharedDownload StartSharedDownload(string cacheKey, Uri uri, Lazy<SharedDownload>? lazyDownload)
+    {
+        var sharedDownload = new SharedDownload(token => DownloadAsync(uri, token));
+        _ = sharedDownload.Task.ContinueWith(
+            static (_, state) =>
+            {
+                var (manager, key, lazy, shared) =
+                    ((ImageExCacheManager Manager, string Key, Lazy<SharedDownload>? Lazy, SharedDownload Shared))state!;
+                if (lazy != null)
+                {
+                    manager.RemoveSharedDownload(key, lazy);
+                }
+
+                shared.Dispose();
+            },
+            (Manager: this, Key: cacheKey, Lazy: lazyDownload, Shared: sharedDownload),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        return sharedDownload;
+    }
+
+    private void RemoveSharedDownload(string cacheKey, Lazy<SharedDownload> lazyDownload)
+    {
+        ((ICollection<KeyValuePair<string, Lazy<SharedDownload>>>)_inFlightDownloads)
+            .Remove(new KeyValuePair<string, Lazy<SharedDownload>>(cacheKey, lazyDownload));
+    }
+
+    private async Task<DownloadResult> DownloadAsync(Uri uri, CancellationToken token)
     {
         const int maxAttempts = 3;
         const int baseDelayMs = 200;
 
-        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        await _downloadConcurrency.WaitAsync(token).ConfigureAwait(false);
+        try
         {
-            try
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
-                using var response = await _httpClient.GetAsync(uri, token).ConfigureAwait(false);
-                response.EnsureSuccessStatusCode();
-                var contentType = response.Content.Headers.ContentType?.MediaType;
-                var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
-                return (bytes, contentType);
+                try
+                {
+                    using var response = await _httpClient.GetAsync(uri, token).ConfigureAwait(false);
+                    response.EnsureSuccessStatusCode();
+                    var contentType = response.Content.Headers.ContentType?.MediaType;
+                    var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+                    return new DownloadResult(bytes, contentType);
+                }
+                catch (HttpRequestException ex) when (IsTransientError(ex) && attempt < maxAttempts - 1)
+                {
+                    var delayMs = baseDelayMs * (1 << attempt); // Exponential: 200ms, 400ms, 800ms
+                    await Task.Delay(delayMs, token).ConfigureAwait(false);
+                }
+                catch (TaskCanceledException) when (!token.IsCancellationRequested && attempt < maxAttempts - 1)
+                {
+                    // Timeout (not user-requested cancellation)
+                    var delayMs = baseDelayMs * (1 << attempt);
+                    await Task.Delay(delayMs, token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Permanent failure or last attempt - bail out
+                    return new DownloadResult(null, null);
+                }
             }
-            catch (HttpRequestException ex) when (IsTransientError(ex) && attempt < maxAttempts - 1)
-            {
-                var delayMs = baseDelayMs * (1 << attempt); // Exponential: 200ms, 400ms, 800ms
-                await Task.Delay(delayMs, token).ConfigureAwait(false);
-            }
-            catch (TaskCanceledException) when (!token.IsCancellationRequested && attempt < maxAttempts - 1)
-            {
-                // Timeout (not user-requested cancellation)
-                var delayMs = baseDelayMs * (1 << attempt);
-                await Task.Delay(delayMs, token).ConfigureAwait(false);
-            }
-            catch
-            {
-                // Permanent failure or last attempt - bail out
-                return (null, null);
-            }
-        }
 
-        return (null, null);
+            return new DownloadResult(null, null);
+        }
+        finally
+        {
+            _downloadConcurrency.Release();
+        }
+    }
+
+    private async Task SaveDownloadedFileAsync(
+        string cacheKey,
+        Uri uri,
+        string filePath,
+        string extension,
+        byte[] bytes,
+        CancellationToken token,
+        bool returnNullOnCancellation)
+    {
+        var writeLock = _cacheWriteLocks.GetOrAdd(cacheKey, static _ => new SemaphoreSlim(1, 1));
+        await writeLock.WaitAsync(returnNullOnCancellation ? CancellationToken.None : token).ConfigureAwait(false);
+
+        try
+        {
+            if (_diskCache.TryGetEntry(cacheKey, out var existingEntry) && existingEntry != null)
+            {
+                var existingPath = _diskCache.GetFilePath(cacheKey, existingEntry.Extension);
+                if (File.Exists(existingPath))
+                {
+                    return;
+                }
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
+            await File.WriteAllBytesAsync(
+                filePath,
+                bytes,
+                returnNullOnCancellation ? CancellationToken.None : token).ConfigureAwait(false);
+
+            _diskCache.AddOrUpdateEntry(cacheKey, new CacheEntry
+            {
+                Url = uri.OriginalString,
+                Extension = extension,
+                DownloadedUtc = DateTimeOffset.UtcNow,
+                LastAccessUtc = DateTimeOffset.UtcNow,
+                SizeBytes = bytes.Length
+            });
+        }
+        finally
+        {
+            writeLock.Release();
+        }
     }
 
     private static bool IsTransientError(HttpRequestException ex)
@@ -258,7 +509,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
         };
     }
 
-    private static async Task<ImageSource?> LoadFromFileAsync(
+    private async Task<ImageSource?> LoadFromFileAsync(
         string filePath,
         bool isSvg,
         int decodeWidth,
@@ -266,9 +517,19 @@ internal sealed partial class ImageExCacheManager : IDisposable
         DecodePixelType decodeType,
         DispatcherQueue? dispatcherQueue = null,
         double dpiScale = 1.0,
-        CancellationToken token = default)
+        CancellationToken token = default,
+        bool returnNullOnCancellation = false)
     {
-        token.ThrowIfCancellationRequested();
+        if (token.IsCancellationRequested)
+        {
+            if (returnNullOnCancellation)
+            {
+                return null;
+            }
+
+            token.ThrowIfCancellationRequested();
+        }
+
         try
         {
             var fileInfo = new FileInfo(filePath);
@@ -277,17 +538,50 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 return null;
             }
 
-            var bytes = await File.ReadAllBytesAsync(filePath, token).ConfigureAwait(false);
-            if (bytes.Length == 0)
+            try
+            {
+                await _decodeConcurrency.WaitAsync(token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (returnNullOnCancellation)
             {
                 return null;
             }
 
-            return await LoadFromBytesAsync(bytes, isSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale).ConfigureAwait(false);
+            try
+            {
+                return await RunOnDispatcherAsync(dispatcherQueue, async () =>
+                {
+                    if (token.IsCancellationRequested)
+                    {
+                        if (returnNullOnCancellation)
+                        {
+                            return default;
+                        }
+
+                        token.ThrowIfCancellationRequested();
+                    }
+
+                    using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    if (fileStream.Length == 0)
+                    {
+                        return default;
+                    }
+
+                    return await LoadFromStreamAsync(fileStream, isSvg, decodeWidth, decodeHeight, decodeType, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
+                }).ConfigureAwait(false);
+            }
+            finally
+            {
+                _decodeConcurrency.Release();
+            }
+        }
+        catch (OperationCanceledException) when (!returnNullOnCancellation)
+        {
+            throw;
         }
         catch (OperationCanceledException)
         {
-            throw;
+            return null;
         }
         catch (Exception ex)
         {
@@ -296,55 +590,116 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
     }
 
-    private static async Task<ImageSource?> LoadFromBytesAsync(
+    private async Task<ImageSource?> LoadFromBytesAsync(
         byte[] bytes,
         bool isSvg,
         int decodeWidth,
         int decodeHeight,
         DecodePixelType decodeType,
         DispatcherQueue? dispatcherQueue = null,
-        double dpiScale = 1.0)
+        double dpiScale = 1.0,
+        CancellationToken token = default,
+        bool returnNullOnCancellation = false)
     {
-        return await RunOnDispatcherAsync(dispatcherQueue, async () =>
+        if (token.IsCancellationRequested)
         {
-            if (isSvg)
+            if (returnNullOnCancellation)
             {
-                var svg = new SvgImageSource();
-                using var svgStream = new MemoryStream(bytes);
-                await svg.SetSourceAsync(svgStream.AsRandomAccessStream());
-                return (ImageSource?)svg;
+                return null;
             }
 
-            var targetWidth = decodeWidth;
-            var targetHeight = decodeHeight;
+            token.ThrowIfCancellationRequested();
+        }
 
-            // VISUAL QUALITY & MEMORY TARGET:
-            // When no explicit decode size is provided, use a DPI-aware fallback to balance quality and memory.
-            // Base size of 400px @ 1x DPI provides good quality for typical UI scenarios (feed images, thumbnails).
-            // Scales linearly with DPI: 1.0x=400px, 1.5x=600px, 2.0x=800px, 3.0x=1200px.
-            // This avoids both full-resolution memory bloat and visible pixelation on high-DPI displays.
-            // For precise control over decode size, callers should set DecodePixelWidth/Height on the ImageEx control.
-            if (targetWidth <= 0 && targetHeight <= 0)
+        try
+        {
+            await _decodeConcurrency.WaitAsync(token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (returnNullOnCancellation)
+        {
+            return null;
+        }
+
+        try
+        {
+            return await RunOnDispatcherAsync(dispatcherQueue, async () =>
             {
-                // Clamp DPI scale to reasonable bounds (0.5x - 4.0x) to prevent extreme decode sizes.
-                var clampedDpiScale = Math.Max(0.5, Math.Min(4.0, dpiScale));
-                targetWidth = (int)Math.Round(400 * clampedDpiScale);
-            }
-
-            var bitmap = new BitmapImage
-            {
-                DecodePixelType = decodeType,
-                CreateOptions = BitmapCreateOptions.IgnoreImageCache
-            };
-
-            if (targetWidth > 0) bitmap.DecodePixelWidth = targetWidth;
-            if (targetHeight > 0) bitmap.DecodePixelHeight = targetHeight;
-
-            using var bitmapStream = new MemoryStream(bytes);
-            await bitmap.SetSourceAsync(bitmapStream.AsRandomAccessStream());
-            return (ImageSource?)bitmap;
-        }).ConfigureAwait(false);
+                using var memoryStream = new MemoryStream(bytes);
+                return await LoadFromStreamAsync(memoryStream, isSvg, decodeWidth, decodeHeight, decodeType, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
+            }).ConfigureAwait(false);
+        }
+        finally
+        {
+            _decodeConcurrency.Release();
+        }
     }
+
+    private static async Task<ImageSource?> LoadFromStreamAsync(
+        Stream stream,
+        bool isSvg,
+        int decodeWidth,
+        int decodeHeight,
+        DecodePixelType decodeType,
+        double dpiScale,
+        CancellationToken token,
+        bool returnNullOnCancellation)
+    {
+        if (token.IsCancellationRequested)
+        {
+            if (returnNullOnCancellation)
+            {
+                return null;
+            }
+
+            token.ThrowIfCancellationRequested();
+        }
+
+        if (isSvg)
+        {
+            var svg = new SvgImageSource();
+            await svg.SetSourceAsync(stream.AsRandomAccessStream());
+            return svg;
+        }
+
+        var targetWidth = decodeWidth;
+        var targetHeight = decodeHeight;
+
+        // VISUAL QUALITY & MEMORY TARGET:
+        // When no explicit decode size is provided, use a DPI-aware fallback to balance quality and memory.
+        // Base size of 400px @ 1x DPI provides good quality for typical UI scenarios (feed images, thumbnails).
+        // Scales linearly with DPI: 1.0x=400px, 1.5x=600px, 2.0x=800px, 3.0x=1200px.
+        // This avoids both full-resolution memory bloat and visible pixelation on high-DPI displays.
+        // For precise control over decode size, callers should set DecodePixelWidth/Height on the ImageEx control.
+        if (targetWidth <= 0 && targetHeight <= 0)
+        {
+            // Clamp DPI scale to reasonable bounds (0.5x - 4.0x) to prevent extreme decode sizes.
+            var clampedDpiScale = Math.Max(0.5, Math.Min(4.0, dpiScale));
+            targetWidth = (int)Math.Round(400 * clampedDpiScale);
+        }
+
+        var bitmap = new BitmapImage
+        {
+            DecodePixelType = decodeType,
+            CreateOptions = BitmapCreateOptions.IgnoreImageCache
+        };
+
+        if (targetWidth > 0) bitmap.DecodePixelWidth = targetWidth;
+        if (targetHeight > 0) bitmap.DecodePixelHeight = targetHeight;
+
+        if (token.IsCancellationRequested)
+        {
+            if (returnNullOnCancellation)
+            {
+                return null;
+            }
+
+            token.ThrowIfCancellationRequested();
+        }
+
+        await bitmap.SetSourceAsync(stream.AsRandomAccessStream());
+        return bitmap;
+    }
+
     private static Task<T?> RunOnDispatcherAsync<T>(DispatcherQueue? dispatcherQueue, Func<Task<T?>> factory)
     {
         if (dispatcherQueue == null || dispatcherQueue.HasThreadAccess)
@@ -465,6 +820,8 @@ internal sealed partial class ImageExCacheManager : IDisposable
         _disposed = true;
         _httpClient.Dispose();
         _cleanupLock.Dispose();
+        _downloadConcurrency.Dispose();
+        _decodeConcurrency.Dispose();
         GC.SuppressFinalize(this);
     }
 }

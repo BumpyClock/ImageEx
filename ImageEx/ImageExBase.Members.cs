@@ -195,13 +195,12 @@ namespace ImageEx
                 var value = (bool)e.NewValue;
                 if (value)
                 {
-                    control.LayoutUpdated += control.ImageExBase_LayoutUpdated;
-
+                    control.AttachLazyLoadingHandlers();
                     control.InvalidateLazyLoading();
                 }
                 else
                 {
-                    control.LayoutUpdated -= control.ImageExBase_LayoutUpdated;
+                    control.DetachLazyLoadingHandlers();
                 }
             }
         }

@@ -17,6 +17,7 @@ namespace ImageEx
 
         //// Used to track if we get a new request, so we can cancel any potential custom cache loading.
         private CancellationTokenSource _tokenSource;
+        private long _sourceRequestVersion;
 
         private object _lazyLoadingSource;
 
@@ -31,6 +32,7 @@ namespace ImageEx
 
         private void OnImageExUnloaded(object sender, RoutedEventArgs e)
         {
+            _isInViewport = false;
             CleanupTokenSource();
         }
 
@@ -70,14 +72,21 @@ namespace ImageEx
 
             if (e.OldValue == null || e.NewValue == null || !e.OldValue.Equals(e.NewValue))
             {
-                if (e.NewValue == null || !control.EnableLazyLoading || control._isInViewport)
+                if (e.NewValue == null)
                 {
                     control._lazyLoadingSource = null;
+                    control.DetachLazyLoadingHandlers();
+                    control.SetSource(e.NewValue);
+                }
+                else if (!control.EnableLazyLoading || control._isInViewport)
+                {
+                    control._lazyLoadingSource = null;
+                    control.DetachLazyLoadingHandlers();
                     control.SetSource(e.NewValue);
                 }
                 else
                 {
-                    control._lazyLoadingSource = e.NewValue;
+                    control.DeferSourceUntilViewport(e.NewValue);
                 }
             }
         }
@@ -111,41 +120,60 @@ namespace ImageEx
             }
         }
 
+        private void DeferSourceUntilViewport(object source)
+        {
+            _lazyLoadingSource = source;
+            AttachLazyLoadingHandlers();
+            SetSource(null);
+            InvalidateLazyLoading();
+        }
+
         private async void SetSource(object source)
         {
+            var requestVersion = Interlocked.Increment(ref _sourceRequestVersion);
+            CancellationTokenSource requestTokenSource = null;
+            var requestToken = CancellationToken.None;
             try
             {
                 if (!IsInitialized)
                 {
                     return;
                 }
-                
-                CancellationTokenSource oldTokenSource = null;
-                
-                if (_tokenSource != null)
+
+                // Cancel any in-flight previous request, then clear the field. A null
+                // _tokenSource signals no active request; any in-flight result from a prior
+                // request will fail the IsRequestCurrent guard in LoadImageAsync.
+                var previousTokenSource = _tokenSource;
+                _tokenSource = null;
+
+                if (previousTokenSource != null)
                 {
-                    oldTokenSource = _tokenSource;
-                    _tokenSource = null;
+                    if (!previousTokenSource.Token.IsCancellationRequested)
+                    {
+                        await previousTokenSource.CancelAsync();
+                    }
+                    previousTokenSource.Dispose();
                 }
 
-                var newTokenSource = new CancellationTokenSource();
-                _tokenSource = newTokenSource;
-
-                if (oldTokenSource != null)
+                if (!IsSourceRequestCurrent(requestVersion))
                 {
-                    if (!oldTokenSource.Token.IsCancellationRequested)
-                    {
-                        await oldTokenSource.CancelAsync();
-                    }
-                    oldTokenSource.Dispose();
+                    return;
                 }
 
                 AttachSource(null);
 
                 if (source == null)
                 {
+                    // No new request to track. _tokenSource stays null so any in-flight result
+                    // from the previous request cannot attach.
                     return;
                 }
+
+                var newTokenSource = new CancellationTokenSource();
+                _tokenSource = newTokenSource;
+                requestTokenSource = newTokenSource;
+                var newToken = newTokenSource.Token;
+                requestToken = newToken;
 
                 VisualStateManager.GoToState(this, LoadingState, true);
                 var imageSource = source as ImageSource;
@@ -166,13 +194,13 @@ namespace ImageEx
                         return;
                     }
                 }
-                
+
                 if (!uri.IsHttpUri() && !uri.IsAbsoluteUri)
                 {
                     uri = new Uri("ms-appx:///" + uri.OriginalString.TrimStart('/'));
                 }
-                
-                await LoadImageAsync(uri, newTokenSource.Token);
+
+                await LoadImageAsync(uri, requestVersion, newTokenSource, newToken);
             }
             catch (OperationCanceledException)
             {
@@ -180,22 +208,33 @@ namespace ImageEx
             }
             catch (Exception e)
             {
-                VisualStateManager.GoToState(this, FailedState, true);
-                ImageExFailed?.Invoke(this, new ImageExFailedEventArgs(e));
+                var requestIsCurrent = requestTokenSource == null
+                    ? IsSourceRequestCurrent(requestVersion)
+                    : IsRequestCurrent(requestVersion, requestTokenSource, requestToken);
+
+                if (requestIsCurrent)
+                {
+                    VisualStateManager.GoToState(this, FailedState, true);
+                    ImageExFailed?.Invoke(this, new ImageExFailedEventArgs(e));
+                }
             }
         }
 
-        private async Task LoadImageAsync(Uri imageUri, CancellationToken token)
+        private async Task LoadImageAsync(
+            Uri imageUri,
+            long requestVersion,
+            CancellationTokenSource requestTokenSource,
+            CancellationToken requestToken)
         {
             if (imageUri != null)
             {
                 if (IsCacheEnabled)
                 {
-                    var img = await ProvideCachedResourceAsync(imageUri, token);
+                    var img = await ProvideCachedResourceAsync(imageUri, requestToken);
 
-                    if (_tokenSource != null && !_tokenSource.IsCancellationRequested)
+                    if (IsRequestCurrent(requestVersion, requestTokenSource, requestToken))
                     {
-                        // Only attach our image if we still have a valid request
+                        // Only attach our image if this is still the active request
                         AttachSource(img);
                     }
                 }
@@ -210,7 +249,7 @@ namespace ImageEx
                         var bitmap = new BitmapImage();
                         await bitmap.SetSourceAsync(new MemoryStream(bytes).AsRandomAccessStream());
 
-                        if (_tokenSource != null && !_tokenSource.IsCancellationRequested)
+                        if (IsRequestCurrent(requestVersion, requestTokenSource, requestToken))
                         {
                             AttachSource(bitmap);
                         }
@@ -221,6 +260,42 @@ namespace ImageEx
                     AttachSource(GetDeterminedSource(imageUri));
                 }
             }
+        }
+
+        /// <summary>
+        /// Returns true when <paramref name="requestTokenSource"/> still represents the active
+        /// request (i.e. it has not been superseded by a newer Source change, null assignment,
+        /// or unload) and has not been cancelled. Used to gate stale attaches and visual-state
+        /// transitions on async completion paths.
+        /// </summary>
+        private bool IsRequestCurrent(
+            long requestVersion,
+            CancellationTokenSource requestTokenSource,
+            CancellationToken requestToken)
+        {
+            if (!IsSourceRequestCurrent(requestVersion))
+            {
+                return false;
+            }
+
+            if (!ReferenceEquals(_tokenSource, requestTokenSource))
+            {
+                return false;
+            }
+
+            try
+            {
+                return !requestToken.IsCancellationRequested;
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
+        }
+
+        private bool IsSourceRequestCurrent(long requestVersion)
+        {
+            return Interlocked.Read(ref _sourceRequestVersion) == requestVersion;
         }
 
         internal static ImageSource GetDeterminedSource(Uri uri)

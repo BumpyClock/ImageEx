@@ -43,6 +43,7 @@ namespace ImageEx
     public abstract partial class ImageExBase : Control, IAlphaMaskProvider
     {
         private bool _isInViewport;
+        private bool _lazyLoadingHandlersAttached;
 
         /// <summary>
         /// Image name in template
@@ -161,16 +162,18 @@ namespace ImageEx
             if (Source == null || !EnableLazyLoading || _isInViewport)
             {
                 _lazyLoadingSource = null;
+                DetachLazyLoadingHandlers();
                 SetSource(Source);
             }
             else
             {
-                _lazyLoadingSource = Source;
+                DeferSourceUntilViewport(Source);
             }
 
             AttachImageOpened(OnImageOpened);
             AttachImageFailed(OnImageFailed);
             
+            Unloaded -= OnImageExUnloaded;
             Unloaded += OnImageExUnloaded;
 
             base.OnApplyTemplate();
@@ -198,9 +201,14 @@ namespace ImageEx
             ImageExFailed?.Invoke(this, new ImageExFailedEventArgs(new Exception(e.ErrorMessage)));
         }
 
-        private void ImageExBase_LayoutUpdated(object sender, object e)
+        private void ImageExBase_Loaded(object sender, RoutedEventArgs e)
         {
             InvalidateLazyLoading();
+        }
+
+        private void ImageExBase_EffectiveViewportChanged(FrameworkElement sender, EffectiveViewportChangedEventArgs args)
+        {
+            InvalidateLazyLoading(args.EffectiveViewport);
         }
 
         private void InvalidateLazyLoading()
@@ -247,12 +255,71 @@ namespace ImageEx
                     var source = _lazyLoadingSource;
                     _lazyLoadingSource = null;
                     SetSource(source);
+                    DetachLazyLoadingHandlers();
                 }
             }
             else
             {
                 _isInViewport = false;
             }
+        }
+
+        private void InvalidateLazyLoading(Rect effectiveViewport)
+        {
+            if (!IsLoaded)
+            {
+                _isInViewport = false;
+                return;
+            }
+
+            var lazyLoadingThreshold = LazyLoadingThreshold;
+            var controlRect = new Rect(0, 0, ActualWidth, ActualHeight);
+            var viewportRect = new Rect(
+                effectiveViewport.X - lazyLoadingThreshold,
+                effectiveViewport.Y - lazyLoadingThreshold,
+                effectiveViewport.Width + (2 * lazyLoadingThreshold),
+                effectiveViewport.Height + (2 * lazyLoadingThreshold));
+
+            if (controlRect.IntersectsWith(viewportRect))
+            {
+                _isInViewport = true;
+
+                if (_lazyLoadingSource != null)
+                {
+                    var source = _lazyLoadingSource;
+                    _lazyLoadingSource = null;
+                    SetSource(source);
+                    DetachLazyLoadingHandlers();
+                }
+            }
+            else
+            {
+                _isInViewport = false;
+            }
+        }
+
+        private void AttachLazyLoadingHandlers()
+        {
+            if (_lazyLoadingHandlersAttached)
+            {
+                return;
+            }
+
+            Loaded += ImageExBase_Loaded;
+            EffectiveViewportChanged += ImageExBase_EffectiveViewportChanged;
+            _lazyLoadingHandlersAttached = true;
+        }
+
+        private void DetachLazyLoadingHandlers()
+        {
+            if (!_lazyLoadingHandlersAttached)
+            {
+                return;
+            }
+
+            Loaded -= ImageExBase_Loaded;
+            EffectiveViewportChanged -= ImageExBase_EffectiveViewportChanged;
+            _lazyLoadingHandlersAttached = false;
         }
     }
 }

@@ -58,7 +58,16 @@ namespace ImageEx
                 DecodePixelType,
                 token,
                 DispatcherQueue,
-                dpiScale);
+                dpiScale,
+                returnNullOnCancellation: true);
+
+            // If this request was superseded (newer Source, null Source, or unload), suppress both
+            // the cache-hit shimmer-skip transition and any fallback attach. Returning null here
+            // lets LoadImageAsync's IsRequestCurrent guard drop the stale result entirely.
+            if (token.IsCancellationRequested)
+            {
+                return null;
+            }
 
             // Skip shimmer animation on cache hit by jumping directly to Loaded state
             if (result.WasCacheHit && result.Image != null)

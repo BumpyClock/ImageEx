@@ -44,6 +44,17 @@ internal sealed class ImageExDiskCache
     }
 
     /// <summary>
+    /// Computes a cache key for the original source bytes, independent of decode parameters.
+    /// </summary>
+    /// <param name="uri">The image URI.</param>
+    /// <returns>16-character hex cache key.</returns>
+    public static string ComputeSourceCacheKey(Uri uri)
+    {
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(uri.OriginalString));
+        return Convert.ToHexString(hash)[..16].ToLowerInvariant();
+    }
+
+    /// <summary>
     /// Determines file extension from content-type header, URL, or fallback.
     /// </summary>
     /// <param name="uri">The image URI.</param>
