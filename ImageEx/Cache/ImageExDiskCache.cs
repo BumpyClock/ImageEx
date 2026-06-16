@@ -197,16 +197,22 @@ internal sealed class ImageExDiskCache
     /// <summary>
     /// Attempts to delete a cached file, ignoring errors.
     /// </summary>
-    public void TryDeleteFile(string filePath)
+    public bool TryDeleteFile(string filePath)
     {
         try
         {
-            if (File.Exists(filePath))
-                File.Delete(filePath);
+            if (!File.Exists(filePath))
+            {
+                return true;
+            }
+
+            File.Delete(filePath);
+            return true;
         }
         catch
         {
-            // Best effort - ignore deletion failures
+            // Best effort - caller decides whether metadata can be removed.
+            return false;
         }
     }
 }

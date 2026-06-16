@@ -34,6 +34,66 @@ namespace ImageEx
         {
             _isInViewport = false;
             CleanupTokenSource();
+
+            if (_currentImageSource != null)
+            {
+                AttachSource(null);
+            }
+        }
+
+        private void OnImageExLoaded(object sender, RoutedEventArgs e)
+        {
+            if (EnableLazyLoading)
+            {
+                InvalidateLazyLoading();
+                if (!_isInViewport)
+                {
+                    return;
+                }
+            }
+
+            RestartSourceIfNeeded();
+        }
+
+        private void RestartSourceIfNeeded()
+        {
+            if (!IsInitialized
+                || Source == null
+                || _tokenSource != null
+                || HasAttachedSource())
+            {
+                return;
+            }
+
+            SetSource(Source);
+        }
+
+        private bool HasAttachedSource()
+        {
+            return Image switch
+            {
+                Image image => image.Source != null,
+                ImageBrush brush => brush.ImageSource != null,
+                _ => false
+            };
+        }
+
+        private bool HasCurrentRequest()
+        {
+            var tokenSource = _tokenSource;
+            if (tokenSource == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                return !tokenSource.Token.IsCancellationRequested;
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
         }
 
         private void CleanupTokenSource()
@@ -97,6 +157,8 @@ namespace ImageEx
         /// <param name="source"><see cref="ImageSource"/> to assign to the image.</param>
         private void AttachSource(ImageSource source)
         {
+            _currentImageSource = source;
+
             // Setting the source at this point should call ImageExOpened/VisualStateManager.GoToState
             // as we register to both the ImageOpened/ImageFailed events of the underlying control.
             // We only need to call those methods if we fail in other cases before we get here.
@@ -111,6 +173,7 @@ namespace ImageEx
 
             if (source == null)
             {
+                _currentImageSource = null;
                 VisualStateManager.GoToState(this, UnloadedState, true);
             }
             else if (source is BitmapSource { PixelHeight: > 0, PixelWidth: > 0 })

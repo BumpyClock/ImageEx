@@ -24,7 +24,9 @@ internal sealed partial class ImageExCacheManager : IDisposable
     /// <summary>
     /// Singleton instance.
     /// </summary>
-    public static ImageExCacheManager Instance { get; } = new();
+    private static readonly Lazy<ImageExCacheManager> s_instance = new(() => new ImageExCacheManager());
+
+    public static ImageExCacheManager Instance => s_instance.Value;
 
     private readonly ImageExDiskCache _diskCache;
     private readonly HttpClient _httpClient;
@@ -36,6 +38,33 @@ internal sealed partial class ImageExCacheManager : IDisposable
     private DateTimeOffset _lastCleanup = DateTimeOffset.MinValue;
     private bool _initialSizeScanned;
     private bool _disposed;
+    private const int TelemetrySampleInterval = 50;
+    private const int MaxSmallDecodedImageCacheEntries = 128;
+    private readonly object _smallDecodedImageCacheLock = new();
+    private readonly Dictionary<string, SmallDecodedImageCacheEntry> _smallDecodedImageCache = new();
+    private readonly LinkedList<string> _smallDecodedImageCacheLru = new();
+    private static long _telemetryRequestCount;
+    private static long _telemetryCacheHitCount;
+    private static long _telemetryCacheMissCount;
+    private static long _telemetryDownloadStartCount;
+    private static long _telemetryDownloadSuccessCount;
+    private static long _telemetryDownloadFailureCount;
+    private static long _telemetryDownloadByteCount;
+    private static long _telemetryCacheWriteStartCount;
+    private static long _telemetryCacheWriteCompleteCount;
+    private static long _telemetryCacheWriteWaitMsTotal;
+    private static long _telemetryActiveCacheWriteCount;
+    private static long _telemetryPeakActiveCacheWriteCount;
+    private static long _telemetryFileDecodeStartCount;
+    private static long _telemetryByteDecodeStartCount;
+    private static long _telemetryDecodeSuccessCount;
+    private static long _telemetryDecodeNullCount;
+    private static long _telemetryDecodeCancelCount;
+    private static long _telemetryDecodeFailureCount;
+    private static long _telemetryActiveDecodeCount;
+    private static long _telemetryPeakActiveDecodeCount;
+
+    private sealed record SmallDecodedImageCacheEntry(ImageSource Image, LinkedListNode<string> LruNode);
 
     /// <summary>
     /// Maximum cache age in days (configurable via DP).
@@ -55,8 +84,8 @@ internal sealed partial class ImageExCacheManager : IDisposable
     internal ImageExCacheManager(
         string cacheDirectory,
         HttpMessageHandler? httpMessageHandler = null,
-        int maxConcurrentDownloads = 4,
-        int maxConcurrentDecodes = 4)
+        int maxConcurrentDownloads = 2,
+        int maxConcurrentDecodes = 2)
     {
         _diskCache = new ImageExDiskCache(cacheDirectory);
         _httpClient = httpMessageHandler == null
@@ -173,11 +202,24 @@ internal sealed partial class ImageExCacheManager : IDisposable
 
         var isSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase);
         var cacheKey = ImageExDiskCache.ComputeSourceCacheKey(uri);
+        if (TryGetSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, isSvg, dpiScale, out var cachedSmallImage))
+        {
+            RecordCacheHit(uri, payloadBytes: 0, decodeWidth, decodeHeight, decodeType);
+            return new CacheResult(cachedSmallImage, WasCacheHit: true);
+        }
+
+        RecordImageRequest(uri, decodeWidth, decodeHeight, decodeType);
 
         await _diskCache.EnsureMetadataLoadedAsync().ConfigureAwait(false);
 
         // 1. Try local cache
-        if (_diskCache.TryGetEntry(cacheKey, out var entry) && entry != null)
+        var hasCacheEntry = _diskCache.TryGetEntry(cacheKey, out var entry) && entry != null;
+        if (!hasCacheEntry)
+        {
+            hasCacheEntry = TryMigrateLegacyCacheEntry(cacheKey, uri, out entry);
+        }
+
+        if (hasCacheEntry && entry != null)
         {
             var filePath = _diskCache.GetFilePath(cacheKey, entry.Extension);
             var age = DateTimeOffset.UtcNow - entry.DownloadedUtc;
@@ -196,6 +238,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
 
                     if (image != null)
                     {
+                        StoreSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, cachedIsSvg, dpiScale, image);
                         _diskCache.UpdateAccessTime(cacheKey);
                         // Fire-and-forget to persist LRU update
                         _ = Task.Run(async () =>
@@ -204,13 +247,18 @@ internal sealed partial class ImageExCacheManager : IDisposable
                             catch { /* Best effort */ }
                         });
 
+                        RecordCacheHit(uri, entry.SizeBytes, decodeWidth, decodeHeight, decodeType);
                         return new CacheResult(image, WasCacheHit: true);
                     }
                     else
                     {
+                        if (token.IsCancellationRequested)
+                        {
+                            return CancelledResult(token, returnNullOnCancellation);
+                        }
+
                         // Cached file failed to decode; remove and re-download.
-                        _diskCache.TryDeleteFile(filePath);
-                        _diskCache.RemoveEntry(cacheKey);
+                        RemoveCacheEntryIfDeleted(cacheKey, filePath);
                     }
                 }
                 catch (OperationCanceledException) when (!returnNullOnCancellation)
@@ -224,20 +272,19 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 catch
                 {
                     // Corrupt file - delete and re-download
-                    _diskCache.TryDeleteFile(filePath);
-                    _diskCache.RemoveEntry(cacheKey);
+                    RemoveCacheEntryIfDeleted(cacheKey, filePath);
                 }
             }
             else
             {
                 // Expired - clean up
                 var expiredPath = _diskCache.GetFilePath(cacheKey, entry.Extension);
-                _diskCache.TryDeleteFile(expiredPath);
-                _diskCache.RemoveEntry(cacheKey);
+                RemoveCacheEntryIfDeleted(cacheKey, expiredPath);
             }
         }
 
         // 2. Download with in-flight deduplication
+        RecordCacheMiss(uri, decodeWidth, decodeHeight, decodeType);
         var result = await AwaitSharedDownloadAsync(cacheKey, uri, token, returnNullOnCancellation).ConfigureAwait(false);
 
         if (result.Bytes == null || token.IsCancellationRequested)
@@ -284,7 +331,106 @@ internal sealed partial class ImageExCacheManager : IDisposable
 
         // 4. Return image from downloaded bytes
         var loadedImage = await LoadFromBytesAsync(result.Bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
+        if (loadedImage != null)
+        {
+            StoreSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, detectedSvg, dpiScale, loadedImage);
+        }
+
         return new CacheResult(loadedImage, WasCacheHit: false);
+    }
+
+    private bool TryGetSmallDecodedImage(
+        Uri uri,
+        int decodeWidth,
+        int decodeHeight,
+        DecodePixelType decodeType,
+        bool isSvg,
+        double dpiScale,
+        out ImageSource? image)
+    {
+        image = null;
+        if (!ShouldCacheDecodedImage(decodeWidth, decodeHeight, isSvg))
+        {
+            return false;
+        }
+
+        var cacheKey = ComputeDecodedImageCacheKey(uri, decodeWidth, decodeHeight, decodeType, isSvg, dpiScale);
+        lock (_smallDecodedImageCacheLock)
+        {
+            if (!_smallDecodedImageCache.TryGetValue(cacheKey, out var entry))
+            {
+                return false;
+            }
+
+            _smallDecodedImageCacheLru.Remove(entry.LruNode);
+            _smallDecodedImageCacheLru.AddLast(entry.LruNode);
+            image = entry.Image;
+            return true;
+        }
+    }
+
+    private void StoreSmallDecodedImage(
+        Uri uri,
+        int decodeWidth,
+        int decodeHeight,
+        DecodePixelType decodeType,
+        bool isSvg,
+        double dpiScale,
+        ImageSource image)
+    {
+        if (!ShouldCacheDecodedImage(decodeWidth, decodeHeight, isSvg))
+        {
+            return;
+        }
+
+        var cacheKey = ComputeDecodedImageCacheKey(uri, decodeWidth, decodeHeight, decodeType, isSvg, dpiScale);
+        lock (_smallDecodedImageCacheLock)
+        {
+            if (_smallDecodedImageCache.TryGetValue(cacheKey, out var existing))
+            {
+                _smallDecodedImageCacheLru.Remove(existing.LruNode);
+                _smallDecodedImageCache.Remove(cacheKey);
+            }
+
+            var node = _smallDecodedImageCacheLru.AddLast(cacheKey);
+            _smallDecodedImageCache[cacheKey] = new SmallDecodedImageCacheEntry(image, node);
+
+            while (_smallDecodedImageCache.Count > MaxSmallDecodedImageCacheEntries)
+            {
+                var first = _smallDecodedImageCacheLru.First;
+                if (first == null)
+                {
+                    break;
+                }
+
+                _smallDecodedImageCacheLru.RemoveFirst();
+                _smallDecodedImageCache.Remove(first.Value);
+            }
+        }
+    }
+
+    private static bool ShouldCacheDecodedImage(int decodeWidth, int decodeHeight, bool isSvg)
+    {
+        if (isSvg)
+        {
+            return false;
+        }
+
+        var constrainedWidth = decodeWidth > 0 && decodeWidth <= 96;
+        var constrainedHeight = decodeHeight > 0 && decodeHeight <= 96;
+        return constrainedWidth || constrainedHeight;
+    }
+
+    private static string ComputeDecodedImageCacheKey(
+        Uri uri,
+        int decodeWidth,
+        int decodeHeight,
+        DecodePixelType decodeType,
+        bool isSvg,
+        double dpiScale)
+    {
+        var dpiBucket = (int)Math.Round(Math.Clamp(dpiScale, 0.5, 4.0) * 100);
+        return $"{ImageExDiskCache.ComputeCacheKey(uri, decodeWidth, decodeHeight, decodeType, isSvg)}:{dpiBucket}";
     }
 
     private static CacheResult CancelledResult(CancellationToken token, bool returnNullOnCancellation)
@@ -410,6 +556,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
         await _downloadConcurrency.WaitAsync(token).ConfigureAwait(false);
         try
         {
+            RecordDownloadStarted(uri);
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
                 try
@@ -418,6 +565,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
                     response.EnsureSuccessStatusCode();
                     var contentType = response.Content.Headers.ContentType?.MediaType;
                     var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+                    RecordDownloadCompleted(uri, bytes.Length);
                     return new DownloadResult(bytes, contentType);
                 }
                 catch (HttpRequestException ex) when (IsTransientError(ex) && attempt < maxAttempts - 1)
@@ -434,15 +582,101 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 catch
                 {
                     // Permanent failure or last attempt - bail out
+                    RecordDownloadFailed(uri);
                     return new DownloadResult(null, null);
                 }
             }
 
+            RecordDownloadFailed(uri);
             return new DownloadResult(null, null);
         }
         finally
         {
             _downloadConcurrency.Release();
+        }
+    }
+
+    private bool TryMigrateLegacyCacheEntry(string sourceCacheKey, Uri uri, out CacheEntry? migratedEntry)
+    {
+        migratedEntry = null;
+        var url = uri.OriginalString;
+        var legacyEntries = _diskCache.GetAllEntries()
+            .Where(entry => entry.Key != sourceCacheKey && string.Equals(entry.Value.Url, url, StringComparison.Ordinal))
+            .OrderByDescending(entry => entry.Value.LastAccessUtc)
+            .ToList();
+
+        foreach (var legacyEntry in legacyEntries)
+        {
+            var legacyPath = _diskCache.GetFilePath(legacyEntry.Key, legacyEntry.Value.Extension);
+            if (!File.Exists(legacyPath))
+            {
+                _diskCache.RemoveEntry(legacyEntry.Key);
+                continue;
+            }
+
+            var sourcePath = _diskCache.GetFilePath(sourceCacheKey, legacyEntry.Value.Extension);
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(sourcePath)!);
+                if (!File.Exists(sourcePath))
+                {
+                    File.Copy(legacyPath, sourcePath, overwrite: false);
+                }
+
+                var sourceFileInfo = new FileInfo(sourcePath);
+                if (sourceFileInfo.Length == 0)
+                {
+                    RemoveCacheEntryIfDeleted(sourceCacheKey, sourcePath);
+                    RemoveCacheEntryIfDeleted(legacyEntry.Key, legacyPath);
+                    continue;
+                }
+
+                migratedEntry = new CacheEntry
+                {
+                    Url = legacyEntry.Value.Url,
+                    Extension = legacyEntry.Value.Extension,
+                    DownloadedUtc = legacyEntry.Value.DownloadedUtc,
+                    LastAccessUtc = DateTimeOffset.UtcNow,
+                    SizeBytes = sourceFileInfo.Length
+                };
+
+                _diskCache.AddOrUpdateEntry(sourceCacheKey, migratedEntry);
+                RemoveLegacyEntriesForUrl(sourceCacheKey, url);
+                return true;
+            }
+            catch (IOException)
+            {
+                // A racing decode/cleanup can touch old cache files. Skip and let download fill source cache.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Treat inaccessible legacy files as unusable for migration.
+            }
+        }
+
+        return false;
+    }
+
+    private void RemoveLegacyEntriesForUrl(string sourceCacheKey, string url)
+    {
+        foreach (var legacyEntry in _diskCache.GetAllEntries())
+        {
+            if (legacyEntry.Key == sourceCacheKey ||
+                !string.Equals(legacyEntry.Value.Url, url, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var legacyPath = _diskCache.GetFilePath(legacyEntry.Key, legacyEntry.Value.Extension);
+            RemoveCacheEntryIfDeleted(legacyEntry.Key, legacyPath);
+        }
+    }
+
+    private void RemoveCacheEntryIfDeleted(string cacheKey, string filePath)
+    {
+        if (_diskCache.TryDeleteFile(filePath))
+        {
+            _diskCache.RemoveEntry(cacheKey);
         }
     }
 
@@ -455,8 +689,11 @@ internal sealed partial class ImageExCacheManager : IDisposable
         CancellationToken token,
         bool returnNullOnCancellation)
     {
+        var waitStopwatch = Stopwatch.StartNew();
         var writeLock = _cacheWriteLocks.GetOrAdd(cacheKey, static _ => new SemaphoreSlim(1, 1));
         await writeLock.WaitAsync(returnNullOnCancellation ? CancellationToken.None : token).ConfigureAwait(false);
+        waitStopwatch.Stop();
+        RecordCacheWriteStarted(bytes.Length, waitStopwatch.Elapsed);
 
         try
         {
@@ -465,6 +702,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 var existingPath = _diskCache.GetFilePath(cacheKey, existingEntry.Extension);
                 if (File.Exists(existingPath))
                 {
+                    RecordCacheWriteCompleted(bytes.Length, skipped: true);
                     return;
                 }
             }
@@ -483,10 +721,13 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 LastAccessUtc = DateTimeOffset.UtcNow,
                 SizeBytes = bytes.Length
             });
+
+            RecordCacheWriteCompleted(bytes.Length, skipped: false);
         }
         finally
         {
             writeLock.Release();
+            RecordCacheWriteEnded();
         }
     }
 
@@ -544,12 +785,14 @@ internal sealed partial class ImageExCacheManager : IDisposable
             }
             catch (OperationCanceledException) when (returnNullOnCancellation)
             {
+                RecordDecodeCanceled("file-wait");
                 return null;
             }
 
             try
             {
-                return await RunOnDispatcherAsync(dispatcherQueue, async () =>
+                RecordDecodeStarted("file", fileInfo.Length, decodeWidth, decodeHeight, decodeType, isSvg);
+                var image = await RunOnDispatcherAsync(dispatcherQueue, async () =>
                 {
                     if (token.IsCancellationRequested)
                     {
@@ -561,7 +804,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
                         token.ThrowIfCancellationRequested();
                     }
 
-                    using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, bufferSize: 4096, FileOptions.SequentialScan);
                     if (fileStream.Length == 0)
                     {
                         return default;
@@ -569,22 +812,28 @@ internal sealed partial class ImageExCacheManager : IDisposable
 
                     return await LoadFromStreamAsync(fileStream, isSvg, decodeWidth, decodeHeight, decodeType, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
                 }).ConfigureAwait(false);
+                RecordDecodeCompleted("file", image != null);
+                return image;
             }
             finally
             {
                 _decodeConcurrency.Release();
+                RecordDecodeEnded();
             }
         }
         catch (OperationCanceledException) when (!returnNullOnCancellation)
         {
+            RecordDecodeCanceled("file");
             throw;
         }
         catch (OperationCanceledException)
         {
+            RecordDecodeCanceled("file");
             return null;
         }
         catch (Exception ex)
         {
+            RecordDecodeFailed("file", ex);
             Debug.WriteLine($"[ImageExCache] Failed to decode cached file {filePath}: {ex.Message}");
             return null;
         }
@@ -617,20 +866,25 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
         catch (OperationCanceledException) when (returnNullOnCancellation)
         {
+            RecordDecodeCanceled("bytes-wait");
             return null;
         }
 
         try
         {
-            return await RunOnDispatcherAsync(dispatcherQueue, async () =>
+            RecordDecodeStarted("bytes", bytes.Length, decodeWidth, decodeHeight, decodeType, isSvg);
+            var image = await RunOnDispatcherAsync(dispatcherQueue, async () =>
             {
                 using var memoryStream = new MemoryStream(bytes);
                 return await LoadFromStreamAsync(memoryStream, isSvg, decodeWidth, decodeHeight, decodeType, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
             }).ConfigureAwait(false);
+            RecordDecodeCompleted("bytes", image != null);
+            return image;
         }
         finally
         {
             _decodeConcurrency.Release();
+            RecordDecodeEnded();
         }
     }
 
@@ -741,6 +995,297 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
     }
 
+    private static void RecordImageRequest(Uri uri, int decodeWidth, int decodeHeight, DecodePixelType decodeType)
+    {
+        var requests = Interlocked.Increment(ref _telemetryRequestCount);
+        if (ShouldSample(requests))
+        {
+            LogTelemetry("request", uri, decodeWidth, decodeHeight, decodeType, payloadBytes: 0);
+        }
+    }
+
+    private static void RecordCacheHit(Uri uri, long payloadBytes, int decodeWidth, int decodeHeight, DecodePixelType decodeType)
+    {
+        var hits = Interlocked.Increment(ref _telemetryCacheHitCount);
+        if (ShouldSample(hits))
+        {
+            LogTelemetry("cache-hit", uri, decodeWidth, decodeHeight, decodeType, payloadBytes);
+        }
+    }
+
+    private static void RecordCacheMiss(Uri uri, int decodeWidth, int decodeHeight, DecodePixelType decodeType)
+    {
+        var misses = Interlocked.Increment(ref _telemetryCacheMissCount);
+        if (ShouldSample(misses))
+        {
+            LogTelemetry("cache-miss", uri, decodeWidth, decodeHeight, decodeType, payloadBytes: 0);
+        }
+    }
+
+    private static void RecordDownloadStarted(Uri uri)
+    {
+        var starts = Interlocked.Increment(ref _telemetryDownloadStartCount);
+        if (ShouldSample(starts))
+        {
+            LogTelemetry("download-start", uri, decodeWidth: 0, decodeHeight: 0, DecodePixelType.Physical, payloadBytes: 0);
+        }
+    }
+
+    private static void RecordDownloadCompleted(Uri uri, int byteCount)
+    {
+        Interlocked.Add(ref _telemetryDownloadByteCount, byteCount);
+        var successes = Interlocked.Increment(ref _telemetryDownloadSuccessCount);
+        if (ShouldSample(successes))
+        {
+            LogTelemetry("download-success", uri, decodeWidth: 0, decodeHeight: 0, DecodePixelType.Physical, byteCount);
+        }
+    }
+
+    private static void RecordDownloadFailed(Uri uri)
+    {
+        var failures = Interlocked.Increment(ref _telemetryDownloadFailureCount);
+        if (ShouldSampleFirstOrEvery(failures))
+        {
+            LogTelemetry("download-fail", uri, decodeWidth: 0, decodeHeight: 0, DecodePixelType.Physical, payloadBytes: 0);
+        }
+    }
+
+    private static void RecordCacheWriteStarted(long payloadBytes, TimeSpan waitTime)
+    {
+        Interlocked.Add(ref _telemetryCacheWriteWaitMsTotal, (long)waitTime.TotalMilliseconds);
+        var starts = Interlocked.Increment(ref _telemetryCacheWriteStartCount);
+        var active = Interlocked.Increment(ref _telemetryActiveCacheWriteCount);
+        var isNewPeak = TryUpdatePeakActiveCacheWrites(active);
+
+        if (isNewPeak || ShouldSample(starts) || waitTime.TotalMilliseconds >= 100)
+        {
+            LogTelemetry(
+                $"cache-write-start:waitMs={waitTime.TotalMilliseconds:F1}",
+                uri: null,
+                decodeWidth: 0,
+                decodeHeight: 0,
+                DecodePixelType.Physical,
+                payloadBytes);
+        }
+    }
+
+    private static void RecordCacheWriteCompleted(long payloadBytes, bool skipped)
+    {
+        var completes = Interlocked.Increment(ref _telemetryCacheWriteCompleteCount);
+        if (skipped || ShouldSample(completes))
+        {
+            LogTelemetry(
+                $"cache-write-complete:skipped={skipped}",
+                uri: null,
+                decodeWidth: 0,
+                decodeHeight: 0,
+                DecodePixelType.Physical,
+                payloadBytes);
+        }
+    }
+
+    private static void RecordCacheWriteEnded()
+    {
+        Interlocked.Decrement(ref _telemetryActiveCacheWriteCount);
+    }
+
+    private static void RecordDecodeStarted(
+        string source,
+        long payloadBytes,
+        int decodeWidth,
+        int decodeHeight,
+        DecodePixelType decodeType,
+        bool isSvg)
+    {
+        if (source == "file")
+        {
+            Interlocked.Increment(ref _telemetryFileDecodeStartCount);
+        }
+        else
+        {
+            Interlocked.Increment(ref _telemetryByteDecodeStartCount);
+        }
+
+        var active = Interlocked.Increment(ref _telemetryActiveDecodeCount);
+        var isNewPeak = TryUpdatePeakActiveDecodes(active);
+        var decodeStarts = Interlocked.Read(ref _telemetryFileDecodeStartCount)
+            + Interlocked.Read(ref _telemetryByteDecodeStartCount);
+
+        if (isNewPeak || ShouldSample(decodeStarts))
+        {
+            LogTelemetry(
+                $"decode-start:{source}:svg={isSvg}",
+                uri: null,
+                decodeWidth,
+                decodeHeight,
+                decodeType,
+                payloadBytes);
+        }
+    }
+
+    private static bool TryUpdatePeakActiveCacheWrites(long activeWrites)
+    {
+        while (true)
+        {
+            var currentPeak = Interlocked.Read(ref _telemetryPeakActiveCacheWriteCount);
+            if (activeWrites <= currentPeak)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref _telemetryPeakActiveCacheWriteCount, activeWrites, currentPeak) == currentPeak)
+            {
+                return true;
+            }
+        }
+    }
+
+    private static void RecordDecodeCompleted(string source, bool success)
+    {
+        var count = success
+            ? Interlocked.Increment(ref _telemetryDecodeSuccessCount)
+            : Interlocked.Increment(ref _telemetryDecodeNullCount);
+
+        if (!success || ShouldSample(count))
+        {
+            LogTelemetry(
+                $"decode-complete:{source}:success={success}",
+                uri: null,
+                decodeWidth: 0,
+                decodeHeight: 0,
+                DecodePixelType.Physical,
+                payloadBytes: 0);
+        }
+    }
+
+    private static void RecordDecodeCanceled(string source)
+    {
+        var cancels = Interlocked.Increment(ref _telemetryDecodeCancelCount);
+        if (ShouldSampleFirstOrEvery(cancels))
+        {
+            LogTelemetry(
+                $"decode-cancel:{source}",
+                uri: null,
+                decodeWidth: 0,
+                decodeHeight: 0,
+                DecodePixelType.Physical,
+                payloadBytes: 0);
+        }
+    }
+
+    private static void RecordDecodeFailed(string source, Exception ex)
+    {
+        Interlocked.Increment(ref _telemetryDecodeFailureCount);
+        Debug.WriteLine($"[ImageExTelemetry] Reason=decode-fail:{source} Error={ex.GetType().Name}:{ex.Message}");
+        LogTelemetry(
+            $"decode-fail:{source}",
+            uri: null,
+            decodeWidth: 0,
+            decodeHeight: 0,
+            DecodePixelType.Physical,
+            payloadBytes: 0);
+    }
+
+    private static void RecordDecodeEnded()
+    {
+        Interlocked.Decrement(ref _telemetryActiveDecodeCount);
+    }
+
+    private static bool TryUpdatePeakActiveDecodes(long activeDecodes)
+    {
+        while (true)
+        {
+            var currentPeak = Interlocked.Read(ref _telemetryPeakActiveDecodeCount);
+            if (activeDecodes <= currentPeak)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref _telemetryPeakActiveDecodeCount, activeDecodes, currentPeak) == currentPeak)
+            {
+                return true;
+            }
+        }
+    }
+
+    private static bool ShouldSample(long count)
+    {
+        return count > 0 && count % TelemetrySampleInterval == 0;
+    }
+
+    private static bool ShouldSampleFirstOrEvery(long count)
+    {
+        return count == 1 || ShouldSample(count);
+    }
+
+    private static void LogTelemetry(
+        string reason,
+        Uri? uri,
+        int decodeWidth,
+        int decodeHeight,
+        DecodePixelType decodeType,
+        long payloadBytes)
+    {
+        var memory = CaptureTelemetryMemory();
+        var host = uri?.Host ?? string.Empty;
+        Debug.WriteLine(
+            "[ImageExTelemetry] " +
+            $"Reason={reason} " +
+            $"Host={host} " +
+            $"DecodeWidth={decodeWidth} " +
+            $"DecodeHeight={decodeHeight} " +
+            $"DecodeType={decodeType} " +
+            $"PayloadKB={payloadBytes / 1024.0:F1} " +
+            $"Requests={Interlocked.Read(ref _telemetryRequestCount)} " +
+            $"CacheHits={Interlocked.Read(ref _telemetryCacheHitCount)} " +
+            $"CacheMisses={Interlocked.Read(ref _telemetryCacheMissCount)} " +
+            $"DownloadStarts={Interlocked.Read(ref _telemetryDownloadStartCount)} " +
+            $"DownloadSuccesses={Interlocked.Read(ref _telemetryDownloadSuccessCount)} " +
+            $"DownloadFailures={Interlocked.Read(ref _telemetryDownloadFailureCount)} " +
+            $"DownloadMB={ToMegabytes(Interlocked.Read(ref _telemetryDownloadByteCount)):F1} " +
+            $"CacheWriteStarts={Interlocked.Read(ref _telemetryCacheWriteStartCount)} " +
+            $"CacheWriteCompletes={Interlocked.Read(ref _telemetryCacheWriteCompleteCount)} " +
+            $"CacheWriteWaitMsTotal={Interlocked.Read(ref _telemetryCacheWriteWaitMsTotal)} " +
+            $"ActiveCacheWrites={Interlocked.Read(ref _telemetryActiveCacheWriteCount)} " +
+            $"PeakActiveCacheWrites={Interlocked.Read(ref _telemetryPeakActiveCacheWriteCount)} " +
+            $"FileDecodeStarts={Interlocked.Read(ref _telemetryFileDecodeStartCount)} " +
+            $"ByteDecodeStarts={Interlocked.Read(ref _telemetryByteDecodeStartCount)} " +
+            $"DecodeSuccesses={Interlocked.Read(ref _telemetryDecodeSuccessCount)} " +
+            $"DecodeNulls={Interlocked.Read(ref _telemetryDecodeNullCount)} " +
+            $"DecodeCancels={Interlocked.Read(ref _telemetryDecodeCancelCount)} " +
+            $"DecodeFailures={Interlocked.Read(ref _telemetryDecodeFailureCount)} " +
+            $"ActiveDecodes={Interlocked.Read(ref _telemetryActiveDecodeCount)} " +
+            $"PeakActiveDecodes={Interlocked.Read(ref _telemetryPeakActiveDecodeCount)} " +
+            $"ManagedMB={memory.ManagedMB:F1} " +
+            $"WorkingSetMB={memory.WorkingSetMB:F1} " +
+            $"PrivateMB={memory.PrivateMB:F1}");
+    }
+
+    private static (double ManagedMB, double WorkingSetMB, double PrivateMB) CaptureTelemetryMemory()
+    {
+        var managedBytes = GC.GetTotalMemory(false);
+        var workingSetBytes = 0L;
+        var privateBytes = 0L;
+
+        try
+        {
+            using var process = Process.GetCurrentProcess();
+            workingSetBytes = process.WorkingSet64;
+            privateBytes = process.PrivateMemorySize64;
+        }
+        catch
+        {
+            // Best-effort diagnostic only.
+        }
+
+        return (ToMegabytes(managedBytes), ToMegabytes(workingSetBytes), ToMegabytes(privateBytes));
+    }
+
+    private static double ToMegabytes(long bytes)
+    {
+        return bytes / (1024.0 * 1024.0);
+    }
+
     private async Task EnforceCleanupIfNeededAsync()
     {
         var now = DateTimeOffset.UtcNow;
@@ -769,10 +1314,12 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 if ((now - kvp.Value.DownloadedUtc).TotalDays > MaxCacheDays)
                 {
                     var path = _diskCache.GetFilePath(kvp.Key, kvp.Value.Extension);
-                    _diskCache.TryDeleteFile(path);
-                    _diskCache.RemoveEntry(kvp.Key);
-                    freedBytes += kvp.Value.SizeBytes;
-                    removed++;
+                    if (_diskCache.TryDeleteFile(path))
+                    {
+                        _diskCache.RemoveEntry(kvp.Key);
+                        freedBytes += kvp.Value.SizeBytes;
+                        removed++;
+                    }
                 }
             }
 
@@ -790,11 +1337,13 @@ internal sealed partial class ImageExCacheManager : IDisposable
                     if (totalSize <= targetSize) break;
 
                     var path = _diskCache.GetFilePath(kvp.Key, kvp.Value.Extension);
-                    _diskCache.TryDeleteFile(path);
-                    _diskCache.RemoveEntry(kvp.Key);
-                    totalSize -= kvp.Value.SizeBytes;
-                    freedBytes += kvp.Value.SizeBytes;
-                    removed++;
+                    if (_diskCache.TryDeleteFile(path))
+                    {
+                        _diskCache.RemoveEntry(kvp.Key);
+                        totalSize -= kvp.Value.SizeBytes;
+                        freedBytes += kvp.Value.SizeBytes;
+                        removed++;
+                    }
                 }
             }
 
@@ -822,6 +1371,17 @@ internal sealed partial class ImageExCacheManager : IDisposable
         _cleanupLock.Dispose();
         _downloadConcurrency.Dispose();
         _decodeConcurrency.Dispose();
+        foreach (var writeLock in _cacheWriteLocks.Values)
+        {
+            writeLock.Dispose();
+        }
+
+        lock (_smallDecodedImageCacheLock)
+        {
+            _smallDecodedImageCache.Clear();
+            _smallDecodedImageCacheLru.Clear();
+        }
+
         GC.SuppressFinalize(this);
     }
 }

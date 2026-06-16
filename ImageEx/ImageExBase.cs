@@ -44,6 +44,7 @@ namespace ImageEx
     {
         private bool _isInViewport;
         private bool _lazyLoadingHandlersAttached;
+        private ImageSource _currentImageSource;
 
         /// <summary>
         /// Image name in template
@@ -159,20 +160,43 @@ namespace ImageEx
 
             ImageExInitialized?.Invoke(this, EventArgs.Empty);
 
-            if (Source == null || !EnableLazyLoading || _isInViewport)
+            if (Source == null)
             {
                 _lazyLoadingSource = null;
                 DetachLazyLoadingHandlers();
                 SetSource(Source);
             }
+            else if (_currentImageSource != null)
+            {
+                AttachSource(_currentImageSource);
+            }
+            else if (HasCurrentRequest())
+            {
+                // Keep current request alive across template reapply.
+            }
+            else if (EnableLazyLoading && !_isInViewport)
+            {
+                if (_lazyLoadingSource == null || !Equals(_lazyLoadingSource, Source))
+                {
+                    DeferSourceUntilViewport(Source);
+                }
+                else
+                {
+                    AttachLazyLoadingHandlers();
+                }
+            }
             else
             {
-                DeferSourceUntilViewport(Source);
+                _lazyLoadingSource = null;
+                DetachLazyLoadingHandlers();
+                SetSource(Source);
             }
 
             AttachImageOpened(OnImageOpened);
             AttachImageFailed(OnImageFailed);
             
+            Loaded -= OnImageExLoaded;
+            Loaded += OnImageExLoaded;
             Unloaded -= OnImageExUnloaded;
             Unloaded += OnImageExUnloaded;
 
@@ -261,6 +285,7 @@ namespace ImageEx
             else
             {
                 _isInViewport = false;
+                SuspendSourceUntilViewport();
             }
         }
 
@@ -295,7 +320,24 @@ namespace ImageEx
             else
             {
                 _isInViewport = false;
+                SuspendSourceUntilViewport();
             }
+        }
+
+        private void SuspendSourceUntilViewport()
+        {
+            if (!EnableLazyLoading
+                || Source == null
+                || _lazyLoadingSource != null
+                || HasCurrentRequest()
+                || HasAttachedSource())
+            {
+                return;
+            }
+
+            _lazyLoadingSource = Source;
+            AttachLazyLoadingHandlers();
+            SetSource(null);
         }
 
         private void AttachLazyLoadingHandlers()
