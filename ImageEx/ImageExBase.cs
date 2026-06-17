@@ -45,6 +45,7 @@ namespace ImageEx
         private bool _isInViewport;
         private bool _lazyLoadingHandlersAttached;
         private ImageSource _currentImageSource;
+        private long _diagnosticAttachedSourceBytes;
 
         /// <summary>
         /// Image name in template
@@ -168,10 +169,24 @@ namespace ImageEx
             }
             else if (_currentImageSource != null)
             {
+                if (EnableLazyLoading)
+                {
+                    AttachLazyLoadingHandlers();
+                }
+                else
+                {
+                    DetachLazyLoadingHandlers();
+                }
+
                 AttachSource(_currentImageSource);
             }
             else if (HasCurrentRequest())
             {
+                if (EnableLazyLoading)
+                {
+                    AttachLazyLoadingHandlers();
+                }
+
                 // Keep current request alive across template reapply.
             }
             else if (EnableLazyLoading && !_isInViewport)
@@ -188,7 +203,15 @@ namespace ImageEx
             else
             {
                 _lazyLoadingSource = null;
-                DetachLazyLoadingHandlers();
+                if (EnableLazyLoading)
+                {
+                    AttachLazyLoadingHandlers();
+                }
+                else
+                {
+                    DetachLazyLoadingHandlers();
+                }
+
                 SetSource(Source);
             }
 
@@ -210,6 +233,7 @@ namespace ImageEx
         /// <param name="e">Event Arguments</param>
         protected virtual void OnImageOpened(object sender, RoutedEventArgs e)
         {
+            UpdateDiagnosticAttachedSourceBytes();
             VisualStateManager.GoToState(this, LoadedState, true);
             ImageExOpened?.Invoke(this, new ImageExOpenedEventArgs());
         }
@@ -279,12 +303,16 @@ namespace ImageEx
                     var source = _lazyLoadingSource;
                     _lazyLoadingSource = null;
                     SetSource(source);
-                    DetachLazyLoadingHandlers();
                 }
             }
             else
             {
                 _isInViewport = false;
+                if (HasAttachedSource())
+                {
+                    ImageExDiagnostics.RecordOffscreenAttached(this);
+                }
+
                 SuspendSourceUntilViewport();
             }
         }
@@ -314,12 +342,16 @@ namespace ImageEx
                     var source = _lazyLoadingSource;
                     _lazyLoadingSource = null;
                     SetSource(source);
-                    DetachLazyLoadingHandlers();
                 }
             }
             else
             {
                 _isInViewport = false;
+                if (HasAttachedSource())
+                {
+                    ImageExDiagnostics.RecordOffscreenAttached(this);
+                }
+
                 SuspendSourceUntilViewport();
             }
         }
@@ -328,15 +360,19 @@ namespace ImageEx
         {
             if (!EnableLazyLoading
                 || Source == null
-                || _lazyLoadingSource != null
-                || HasCurrentRequest()
-                || HasAttachedSource())
+                || _lazyLoadingSource != null)
             {
                 return;
             }
 
+            var hadAttachedSource = HasAttachedSource();
             _lazyLoadingSource = Source;
             AttachLazyLoadingHandlers();
+            if (hadAttachedSource)
+            {
+                ImageExDiagnostics.RecordOffscreenDetach(this);
+            }
+
             SetSource(null);
         }
 

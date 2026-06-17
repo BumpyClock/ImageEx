@@ -90,6 +90,8 @@ namespace ImageEx
         // ReSharper disable once MemberCanBeProtected.Global
         public bool IsInitialized { get; private set; }
 
+        public bool HasAttachedSourceForDiagnostics => HasAttachedSource();
+
         /// <summary>
         /// Gets or sets DecodePixelHeight for underlying bitmap
         /// </summary>

@@ -138,10 +138,16 @@ namespace ImageEx
                     control.DetachLazyLoadingHandlers();
                     control.SetSource(e.NewValue);
                 }
-                else if (!control.EnableLazyLoading || control._isInViewport)
+                else if (!control.EnableLazyLoading)
                 {
                     control._lazyLoadingSource = null;
                     control.DetachLazyLoadingHandlers();
+                    control.SetSource(e.NewValue);
+                }
+                else if (control._isInViewport)
+                {
+                    control._lazyLoadingSource = null;
+                    control.AttachLazyLoadingHandlers();
                     control.SetSource(e.NewValue);
                 }
                 else
@@ -157,7 +163,16 @@ namespace ImageEx
         /// <param name="source"><see cref="ImageSource"/> to assign to the image.</param>
         private void AttachSource(ImageSource source)
         {
+            var previousSource = _currentImageSource;
+            var nextDecodedBytes = ImageExDiagnostics.EstimateDecodedBytes(source);
+            ImageExDiagnostics.RecordAttach(
+                this,
+                previousSource,
+                source,
+                _diagnosticAttachedSourceBytes,
+                nextDecodedBytes);
             _currentImageSource = source;
+            _diagnosticAttachedSourceBytes = source == null ? 0 : nextDecodedBytes;
 
             // Setting the source at this point should call ImageExOpened/VisualStateManager.GoToState
             // as we register to both the ImageOpened/ImageFailed events of the underlying control.
@@ -173,11 +188,11 @@ namespace ImageEx
 
             if (source == null)
             {
-                _currentImageSource = null;
                 VisualStateManager.GoToState(this, UnloadedState, true);
             }
             else if (source is BitmapSource { PixelHeight: > 0, PixelWidth: > 0 })
             {
+                UpdateDiagnosticAttachedSourceBytes();
                 VisualStateManager.GoToState(this, LoadedState, true);
                 ImageExOpened?.Invoke(this, new ImageExOpenedEventArgs());
             }
@@ -185,10 +200,28 @@ namespace ImageEx
 
         private void DeferSourceUntilViewport(object source)
         {
+            ImageExDiagnostics.RecordLazyDeferred(this);
             _lazyLoadingSource = source;
             AttachLazyLoadingHandlers();
             SetSource(null);
             InvalidateLazyLoading();
+        }
+
+        private void UpdateDiagnosticAttachedSourceBytes()
+        {
+            if (_currentImageSource == null)
+            {
+                return;
+            }
+
+            var decodedBytes = ImageExDiagnostics.EstimateDecodedBytes(_currentImageSource);
+            if (decodedBytes == _diagnosticAttachedSourceBytes)
+            {
+                return;
+            }
+
+            ImageExDiagnostics.RecordAttachedBytesChanged(this, _diagnosticAttachedSourceBytes, decodedBytes);
+            _diagnosticAttachedSourceBytes = decodedBytes;
         }
 
         private async void SetSource(object source)
@@ -281,6 +314,23 @@ namespace ImageEx
                     ImageExFailed?.Invoke(this, new ImageExFailedEventArgs(e));
                 }
             }
+            finally
+            {
+                CompleteSourceRequest(requestVersion, requestTokenSource);
+            }
+        }
+
+        private void CompleteSourceRequest(long requestVersion, CancellationTokenSource requestTokenSource)
+        {
+            if (requestTokenSource == null
+                || !IsSourceRequestCurrent(requestVersion)
+                || !ReferenceEquals(_tokenSource, requestTokenSource))
+            {
+                return;
+            }
+
+            _tokenSource = null;
+            requestTokenSource.Dispose();
         }
 
         private async Task LoadImageAsync(
@@ -410,6 +460,7 @@ namespace ImageEx
         protected virtual Task<ImageSource> ProvideCachedResourceAsync(Uri imageUri, CancellationToken token)
         {
             // By default, we just use the built-in UWP image cache provided within the Image control.
+            ImageExDiagnostics.RecordBaseBitmapCreated(imageUri, DecodePixelWidth, DecodePixelHeight, DecodePixelType);
             return Task.FromResult((ImageSource)new BitmapImage(imageUri));
         }
     }

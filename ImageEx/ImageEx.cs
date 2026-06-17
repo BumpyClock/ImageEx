@@ -43,6 +43,11 @@ namespace ImageEx
                 return await base.ProvideCachedResourceAsync(imageUri, token);
             }
 
+            if (ImageExDiagnostics.DisableHttpImages)
+            {
+                return null;
+            }
+
             // Configure cache manager from dependency properties
             var manager = ImageExCacheManager.Instance;
             manager.MaxCacheDays = DiskCacheDays;
@@ -75,8 +80,13 @@ namespace ImageEx
                 VisualStateManager.GoToState(this, LoadedState, useTransitions: false);
             }
 
-            // Return cached/downloaded image, or fall back to base behavior on failure
-            return result.Image ?? await base.ProvideCachedResourceAsync(imageUri, token);
+            if (result.Image != null)
+            {
+                return result.Image;
+            }
+
+            ImageExDiagnostics.RecordHttpFallback(imageUri, DecodePixelWidth, DecodePixelHeight, DecodePixelType);
+            return null;
         }
     }
 }
