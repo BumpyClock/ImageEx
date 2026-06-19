@@ -1,3 +1,10 @@
+// Licensed to the .NET Foundation under one or more agreements.
+// The .NET Foundation licenses this file to you under the MIT license.
+// See the LICENSE file in the project root for more information.
+
+#nullable enable
+
+using System.IO;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using System.Diagnostics;
@@ -23,6 +30,7 @@ namespace ImageEx
     public static class ImageExDiagnostics
     {
         private const int SampleInterval = 25;
+        private const long LargeDecodedImageBytes = 4L * 1024 * 1024;
         private static readonly bool s_disableHttpImages = IsEnabled("DIGESTS_IMAGEEX_DISABLE_HTTP_IMAGES");
         private static readonly bool s_disableHttpFallback = IsEnabled("DIGESTS_IMAGEEX_DISABLE_HTTP_FALLBACK");
         private static long s_attachCount;
@@ -75,8 +83,8 @@ namespace ImageEx
 
         internal static void RecordAttach(
             ImageExBase control,
-            ImageSource previousSource,
-            ImageSource nextSource,
+            ImageSource? previousSource,
+            ImageSource? nextSource,
             long previousDecodedBytes,
             long nextDecodedBytes)
         {
@@ -101,13 +109,14 @@ namespace ImageEx
             }
 
             var totalChanges = Interlocked.Read(ref s_attachCount) + Interlocked.Read(ref s_detachCount);
-            if (ShouldSample(totalChanges) || nextDecodedBytes >= 8 * 1024 * 1024)
+            var sourceBytes = nextSource != null ? nextDecodedBytes : previousDecodedBytes;
+            if (ShouldLogSourceEvent(sourceBytes, totalChanges))
             {
-                LogSnapshot($"attach:{control.GetType().Name}");
+                LogSourceEvent(control, "attach", nextSource ?? previousSource, sourceBytes);
             }
         }
 
-        internal static void RecordAttachedBytesChanged(ImageExBase control, long previousBytes, long nextBytes)
+        internal static void RecordAttachedBytesChanged(ImageExBase control, ImageSource? source, long previousBytes, long nextBytes)
         {
             var delta = nextBytes - previousBytes;
             if (delta == 0)
@@ -117,11 +126,11 @@ namespace ImageEx
 
             var activeBytes = Interlocked.Add(ref s_activeAttachedDecodedBytes, delta);
             UpdatePeakActiveAttachedDecodedBytes(activeBytes);
-            Interlocked.Increment(ref s_imageOpenedCount);
+            var openedCount = Interlocked.Increment(ref s_imageOpenedCount);
 
-            if (ShouldSample(Interlocked.Read(ref s_imageOpenedCount)) || nextBytes >= 8 * 1024 * 1024)
+            if (ShouldLogSourceEvent(nextBytes, openedCount))
             {
-                LogSnapshot($"opened:{control.GetType().Name}");
+                LogSourceEvent(control, "opened", source, nextBytes);
             }
         }
 
@@ -155,16 +164,19 @@ namespace ImageEx
         internal static void RecordHttpFallback(Uri uri, int decodeWidth, int decodeHeight, DecodePixelType decodeType)
         {
             var count = Interlocked.Increment(ref s_httpFallbackCount);
-            Debug.WriteLine(
-                "[ImageExDiagnostics] " +
-                $"Context=http-fallback " +
-                $"Host={uri.Host} " +
-                $"DecodeWidth={decodeWidth} " +
-                $"DecodeHeight={decodeHeight} " +
-                $"DecodeType={decodeType} " +
-                $"HttpFallbacks={count} " +
-                $"DisableHttpFallback={DisableHttpFallback}");
-            LogSnapshot("http-fallback");
+            if (count == 1 || ShouldSample(count))
+            {
+                Debug.WriteLine(
+                    "[ImageExDiagnostics] " +
+                    $"Context=http-fallback " +
+                    $"Host={uri.Host} " +
+                    $"DecodeWidth={decodeWidth} " +
+                    $"DecodeHeight={decodeHeight} " +
+                    $"DecodeType={decodeType} " +
+                    $"HttpFallbacks={count} " +
+                    $"DisableHttpFallback={DisableHttpFallback}");
+                LogSnapshot("http-fallback");
+            }
         }
 
         internal static void RecordHttpFallbackResult(ImageSource source)
@@ -248,6 +260,11 @@ namespace ImageEx
             return count > 0 && count % SampleInterval == 0;
         }
 
+        private static bool ShouldLogSourceEvent(long decodedBytes, long count)
+        {
+            return decodedBytes >= LargeDecodedImageBytes || ShouldSample(count);
+        }
+
         private static bool IsEnabled(string name)
         {
             var value = Environment.GetEnvironmentVariable(name);
@@ -279,6 +296,68 @@ namespace ImageEx
         private static double ToMegabytes(long bytes)
         {
             return bytes / (1024.0 * 1024.0);
+        }
+
+        private static void LogSourceEvent(ImageExBase control, string context, ImageSource? source, long sourceDecodedBytes)
+        {
+            var bitmap = source as BitmapImage;
+            var pixelWidth = 0;
+            var pixelHeight = 0;
+            if (source is BitmapSource bitmapSource)
+            {
+                pixelWidth = bitmapSource.PixelWidth;
+                pixelHeight = bitmapSource.PixelHeight;
+            }
+            var decodeWidth = bitmap?.DecodePixelWidth ?? 0;
+            var decodeHeight = bitmap?.DecodePixelHeight ?? 0;
+            var decodeType = bitmap?.DecodePixelType.ToString() ?? string.Empty;
+            var sourceType = source?.GetType().Name ?? string.Empty;
+            var uri = TryGetSourceUri(source);
+            var activeDecodedBytes = Interlocked.Read(ref s_activeAttachedDecodedBytes);
+
+            Debug.WriteLine(
+                "[ImageExDiagnostics] " +
+                $"Context={context} " +
+                $"ControlType={control.GetType().Name} " +
+                $"SourceType={sourceType} " +
+                $"UriScheme={uri?.Scheme ?? string.Empty} " +
+                $"UriHost={uri?.Host ?? string.Empty} " +
+                $"UriExtension={GetUriExtension(uri)} " +
+                $"PixelWidth={pixelWidth} " +
+                $"PixelHeight={pixelHeight} " +
+                $"DecodePixelWidth={decodeWidth} " +
+                $"DecodePixelHeight={decodeHeight} " +
+                $"DecodePixelType={decodeType} " +
+                $"IsLoaded={control.IsLoaded} " +
+                $"EnableLazyLoading={control.EnableLazyLoading} " +
+                $"InViewport={control.IsInViewport} " +
+                $"SourceDecodedMB={ToMegabytes(sourceDecodedBytes):F1} " +
+                $"ActiveDecodedMB={ToMegabytes(activeDecodedBytes):F1}");
+        }
+
+        private static Uri? TryGetSourceUri(ImageSource? source)
+        {
+            if (source == null)
+            {
+                return null;
+            }
+
+            return source switch
+            {
+                BitmapImage bitmap when ImageExDeferredBitmapSourceRegistry.TryGetDeferredUriSource(bitmap, out var uri) => uri,
+                SvgImageSource svg => svg.UriSource,
+                _ => null
+            };
+        }
+
+        private static string GetUriExtension(Uri? uri)
+        {
+            if (uri == null)
+            {
+                return string.Empty;
+            }
+
+            return Path.GetExtension(uri.AbsolutePath);
         }
     }
 }

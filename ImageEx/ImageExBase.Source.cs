@@ -30,6 +30,8 @@ namespace ImageEx
             set { SetValue(SourceProperty, value); }
         }
 
+        internal bool IsInViewport => _isInViewport;
+
         private void OnImageExUnloaded(object sender, RoutedEventArgs e)
         {
             _isInViewport = false;
@@ -186,6 +188,8 @@ namespace ImageEx
                 brush.ImageSource = source;
             }
 
+            ImageExDeferredBitmapSourceRegistry.TryApplyDeferredUriSource(source);
+
             if (source == null)
             {
                 VisualStateManager.GoToState(this, UnloadedState, true);
@@ -220,7 +224,7 @@ namespace ImageEx
                 return;
             }
 
-            ImageExDiagnostics.RecordAttachedBytesChanged(this, _diagnosticAttachedSourceBytes, decodedBytes);
+            ImageExDiagnostics.RecordAttachedBytesChanged(this, _currentImageSource, _diagnosticAttachedSourceBytes, decodedBytes);
             _diagnosticAttachedSourceBytes = decodedBytes;
         }
 
@@ -418,10 +422,12 @@ namespace ImageEx
                 return new SvgImageSource(uri);
             }
 
-            return new BitmapImage(uri)
-            {
-                CreateOptions = BitmapCreateOptions.IgnoreImageCache
-            };
+            return ImageExDeferredBitmapSourceRegistry.CreateDeferredBitmapImage(
+                uri,
+                decodeWidth: 0,
+                decodeHeight: 0,
+                decodeType: DecodePixelType.Physical,
+                createOptions: BitmapCreateOptions.IgnoreImageCache);
         }
 
         /// <summary>
@@ -461,7 +467,12 @@ namespace ImageEx
         {
             // By default, we just use the built-in UWP image cache provided within the Image control.
             ImageExDiagnostics.RecordBaseBitmapCreated(imageUri, DecodePixelWidth, DecodePixelHeight, DecodePixelType);
-            return Task.FromResult((ImageSource)new BitmapImage(imageUri));
+            return Task.FromResult((ImageSource)ImageExDeferredBitmapSourceRegistry.CreateDeferredBitmapImage(
+                imageUri,
+                DecodePixelWidth,
+                DecodePixelHeight,
+                DecodePixelType,
+                BitmapCreateOptions.None));
         }
     }
 }

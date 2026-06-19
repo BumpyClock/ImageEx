@@ -6,8 +6,11 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http;
+using System.Runtime.InteropServices.WindowsRuntime;
 using ImageEx;
 using Microsoft.UI.Dispatching;
+using Windows.Graphics.Imaging;
+using Windows.Storage.Streams;
 
 namespace ImageEx.Cache;
 
@@ -31,6 +34,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
     private readonly ImageExDiskCache _diskCache;
     private readonly HttpClient _httpClient;
     private readonly ConcurrentDictionary<string, Lazy<SharedDownload>> _inFlightDownloads = new();
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _recentDownloadFailures = new();
     private readonly Dictionary<string, CacheWriteLock> _cacheWriteLocks = new();
     private readonly object _cacheWriteLocksGate = new();
     private readonly SemaphoreSlim _cleanupLock = new(1, 1);
@@ -44,6 +48,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
     private const long MaxSmallDecodedImageCacheBytes = 32L * 1024 * 1024;
     private const long MaxSmallDecodedImageCacheEntryBytes = 2L * 1024 * 1024;
     private const int MaxSmallDecodedImageCacheDimension = 512;
+    private static readonly TimeSpan DownloadFailureBackoff = TimeSpan.FromMinutes(10);
     private readonly object _smallDecodedImageCacheLock = new();
     private readonly Dictionary<string, SmallDecodedImageCacheEntry> _smallDecodedImageCache = new();
     private readonly LinkedList<string> _smallDecodedImageCacheLru = new();
@@ -133,6 +138,12 @@ internal sealed partial class ImageExCacheManager : IDisposable
         long DiskCacheBytes);
 
     private readonly record struct DownloadResult(byte[]? Bytes, string? ContentType);
+
+    private readonly record struct DecodeDimensions(
+        int TargetWidth,
+        int TargetHeight,
+        int NaturalWidth,
+        int NaturalHeight);
 
     private sealed class SharedDownload : IDisposable
     {
@@ -316,6 +327,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
                         });
 
                         RecordCacheHit(uri, entry.SizeBytes, decodeWidth, decodeHeight, decodeType);
+                        ForgetDownloadFailure(cacheKey);
                         return new CacheResult(image, WasCacheHit: true);
                     }
                     else
@@ -352,11 +364,25 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
 
         // 2. Download with in-flight deduplication
+        if (IsRecentDownloadFailure(cacheKey))
+        {
+            return new CacheResult(null, false);
+        }
+
         RecordCacheMiss(uri, decodeWidth, decodeHeight, decodeType);
         var result = await AwaitSharedDownloadAsync(cacheKey, uri, token, returnNullOnCancellation).ConfigureAwait(false);
 
         if (result.Bytes == null || token.IsCancellationRequested)
+        {
+            if (!token.IsCancellationRequested)
+            {
+                RememberDownloadFailure(cacheKey);
+            }
+
             return new CacheResult(null, false);
+        }
+
+        ForgetDownloadFailure(cacheKey);
 
         // Detect SVG from content-type if URL didn't have .svg extension
         var detectedSvg = isSvg || result.ContentType == "image/svg+xml";
@@ -573,6 +599,32 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 }
             }
         }
+    }
+
+    private bool IsRecentDownloadFailure(string cacheKey)
+    {
+        if (!_recentDownloadFailures.TryGetValue(cacheKey, out var failedAt))
+        {
+            return false;
+        }
+
+        if (DateTimeOffset.UtcNow - failedAt < DownloadFailureBackoff)
+        {
+            return true;
+        }
+
+        _recentDownloadFailures.TryRemove(cacheKey, out _);
+        return false;
+    }
+
+    private void RememberDownloadFailure(string cacheKey)
+    {
+        _recentDownloadFailures[cacheKey] = DateTimeOffset.UtcNow;
+    }
+
+    private void ForgetDownloadFailure(string cacheKey)
+    {
+        _recentDownloadFailures.TryRemove(cacheKey, out _);
     }
 
     private static async Task<DownloadResult?> WaitForDownloadOrCancellationAsync(
@@ -939,11 +991,6 @@ internal sealed partial class ImageExCacheManager : IDisposable
                         token.ThrowIfCancellationRequested();
                     }
 
-                    if (!isSvg)
-                    {
-                        return LoadBitmapImageFromFileUri(cacheKey, filePath, decodeWidth, decodeHeight, decodeType, dpiScale);
-                    }
-
                     using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, bufferSize: 4096, FileOptions.SequentialScan);
                     return await LoadFromStreamAsync(fileStream, isSvg, decodeWidth, decodeHeight, decodeType, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
                 }).ConfigureAwait(false);
@@ -1023,24 +1070,6 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
     }
 
-    private ImageSource? LoadBitmapImageFromFileUri(
-        string cacheKey,
-        string filePath,
-        int decodeWidth,
-        int decodeHeight,
-        DecodePixelType decodeType,
-        double dpiScale)
-    {
-        var bitmap = CreateBitmapImage(decodeWidth, decodeHeight, decodeType, dpiScale, BitmapCreateOptions.None);
-        bitmap.ImageFailed += (_, args) =>
-        {
-            Debug.WriteLine($"[ImageExCache] Cached URI decode failed for {filePath}: {args.ErrorMessage}");
-            RemoveCacheEntryIfDeleted(cacheKey, filePath);
-        };
-        bitmap.UriSource = new Uri(Path.GetFullPath(filePath), UriKind.Absolute);
-        return bitmap;
-    }
-
     private static async Task<ImageSource?> LoadFromStreamAsync(
         Stream stream,
         bool isSvg,
@@ -1063,8 +1092,9 @@ internal sealed partial class ImageExCacheManager : IDisposable
 
         if (isSvg)
         {
+            using var svgStream = stream.AsRandomAccessStream();
             var svg = new SvgImageSource();
-            await svg.SetSourceAsync(stream.AsRandomAccessStream());
+            await svg.SetSourceAsync(svgStream);
             return svg;
         }
 
@@ -1078,9 +1108,215 @@ internal sealed partial class ImageExCacheManager : IDisposable
             token.ThrowIfCancellationRequested();
         }
 
-        var bitmap = CreateBitmapImage(decodeWidth, decodeHeight, decodeType, dpiScale, BitmapCreateOptions.IgnoreImageCache);
-        await bitmap.SetSourceAsync(stream.AsRandomAccessStream());
+        using var bitmapStream = stream.AsRandomAccessStream();
+        var dimensions = await ResolveDecodeDimensionsAsync(bitmapStream, decodeWidth, decodeHeight, dpiScale, token, returnNullOnCancellation);
+        if (dimensions == null)
+        {
+            return null;
+        }
+
+        if (ShouldPrescale(dimensions.Value))
+        {
+            bitmapStream.Seek(0);
+
+            var prescaledBitmap = await CreatePrescaledBitmapAsync(
+                bitmapStream,
+                dimensions.Value,
+                decodeType,
+                dpiScale,
+                token,
+                returnNullOnCancellation);
+            if (prescaledBitmap == null)
+            {
+                return null;
+            }
+
+            return prescaledBitmap;
+        }
+
+        bitmapStream.Seek(0);
+        var bitmap = CreateBitmapImage(dimensions.Value.TargetWidth, dimensions.Value.TargetHeight, decodeType, dpiScale, BitmapCreateOptions.IgnoreImageCache);
+        await bitmap.SetSourceAsync(bitmapStream);
         return bitmap;
+    }
+
+    private static bool ShouldPrescale(DecodeDimensions dimensions)
+    {
+        return dimensions.TargetWidth > 0 &&
+            dimensions.TargetHeight > 0 &&
+            dimensions.NaturalWidth > 0 &&
+            dimensions.NaturalHeight > 0 &&
+            dimensions.TargetWidth < dimensions.NaturalWidth &&
+            dimensions.TargetHeight < dimensions.NaturalHeight;
+    }
+
+    private static async Task<DecodeDimensions?> ResolveDecodeDimensionsAsync(
+        IRandomAccessStream stream,
+        int decodeWidth,
+        int decodeHeight,
+        double dpiScale,
+        CancellationToken token,
+        bool returnNullOnCancellation)
+    {
+        if (token.IsCancellationRequested)
+        {
+            if (returnNullOnCancellation)
+            {
+                return null;
+            }
+
+            token.ThrowIfCancellationRequested();
+        }
+
+        try
+        {
+            var decoder = await BitmapDecoder.CreateAsync(stream);
+            var naturalWidth = (int)decoder.OrientedPixelWidth;
+            var naturalHeight = (int)decoder.OrientedPixelHeight;
+            if (naturalWidth <= 0 || naturalHeight <= 0)
+            {
+                Debug.WriteLine("[ImageExCache] Failed to read natural image size for prescale.");
+                return decodeWidth > 0 || decodeHeight > 0
+                    ? null
+                    : new DecodeDimensions(0, 0, 0, 0);
+            }
+
+            if (decodeWidth <= 0 && decodeHeight <= 0)
+            {
+                var fallbackWidth = ResolveFallbackDecodeWidth(dpiScale);
+                var fallbackHeight = Math.Max(1, (int)Math.Round(fallbackWidth * (naturalHeight / (double)naturalWidth)));
+                return new DecodeDimensions(fallbackWidth, fallbackHeight, naturalWidth, naturalHeight);
+            }
+
+            if (decodeWidth > 0 && decodeHeight > 0)
+            {
+                return new DecodeDimensions(decodeWidth, decodeHeight, naturalWidth, naturalHeight);
+            }
+
+            if (decodeWidth > 0)
+            {
+                var scaledHeight = Math.Max(1, (int)Math.Round(decodeWidth * (naturalHeight / (double)naturalWidth)));
+                return new DecodeDimensions(decodeWidth, scaledHeight, naturalWidth, naturalHeight);
+            }
+
+            var scaledWidth = Math.Max(1, (int)Math.Round(decodeHeight * (naturalWidth / (double)naturalHeight)));
+            return new DecodeDimensions(scaledWidth, decodeHeight, naturalWidth, naturalHeight);
+        }
+        catch (OperationCanceledException) when (returnNullOnCancellation)
+        {
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            token.ThrowIfCancellationRequested();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[ImageExCache] Failed to resolve prescale dimensions: {ex.Message}");
+            return decodeWidth > 0 || decodeHeight > 0
+                ? null
+                : new DecodeDimensions(0, 0, 0, 0);
+        }
+    }
+
+    private static async Task<ImageSource?> CreatePrescaledBitmapAsync(
+        IRandomAccessStream sourceStream,
+        DecodeDimensions dimensions,
+        DecodePixelType decodeType,
+        double dpiScale,
+        CancellationToken token,
+        bool returnNullOnCancellation)
+    {
+        if (token.IsCancellationRequested)
+        {
+            if (returnNullOnCancellation)
+            {
+                return null;
+            }
+
+            token.ThrowIfCancellationRequested();
+        }
+
+        var stage = "start";
+        try
+        {
+            stage = "decoder-create";
+            var decoder = await BitmapDecoder.CreateAsync(sourceStream).AsTask(token);
+            var sourceWidth = (int)decoder.PixelWidth;
+            var sourceHeight = (int)decoder.PixelHeight;
+            var orientationSwapsAxes = sourceWidth > 0 &&
+                sourceHeight > 0 &&
+                (sourceWidth != dimensions.NaturalWidth || sourceHeight != dimensions.NaturalHeight);
+
+            var transformWidth = dimensions.TargetWidth;
+            var transformHeight = dimensions.TargetHeight;
+            if (orientationSwapsAxes)
+            {
+                (transformWidth, transformHeight) = (transformHeight, transformWidth);
+            }
+
+            var transform = new BitmapTransform
+            {
+                ScaledWidth = (uint)transformWidth,
+                ScaledHeight = (uint)transformHeight,
+                InterpolationMode = BitmapInterpolationMode.Fant
+            };
+
+            stage = "get-pixel-data";
+            var pixelData = await decoder.GetPixelDataAsync(
+                BitmapPixelFormat.Bgra8,
+                BitmapAlphaMode.Premultiplied,
+                transform,
+                ExifOrientationMode.RespectExifOrientation,
+                ColorManagementMode.DoNotColorManage).AsTask(token);
+
+            var pixels = pixelData.DetachPixelData();
+            var expectedBytes = checked(dimensions.TargetWidth * dimensions.TargetHeight * 4);
+            if (pixels.Length != expectedBytes)
+            {
+                Debug.WriteLine(
+                    "[ImageExCache] Prescale pixel size mismatch: " +
+                    $"expected={expectedBytes} actual={pixels.Length} " +
+                    $"target={dimensions.TargetWidth}x{dimensions.TargetHeight} " +
+                    $"transform={transformWidth}x{transformHeight}");
+                return null;
+            }
+
+            if (token.IsCancellationRequested)
+            {
+                if (returnNullOnCancellation)
+                {
+                    return null;
+                }
+
+                token.ThrowIfCancellationRequested();
+            }
+
+            stage = "writeable-bitmap";
+            var bitmap = new WriteableBitmap(dimensions.TargetWidth, dimensions.TargetHeight);
+            using (var pixelBufferStream = bitmap.PixelBuffer.AsStream())
+            {
+                await pixelBufferStream.WriteAsync(pixels, 0, pixels.Length, token);
+            }
+
+            bitmap.Invalidate();
+            return bitmap;
+        }
+        catch (OperationCanceledException) when (returnNullOnCancellation)
+        {
+            return null;
+        }
+        catch (OperationCanceledException)
+        {
+            token.ThrowIfCancellationRequested();
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[ImageExCache] Failed to prescale image stream at {stage}: {ex.GetType().Name} HResult=0x{ex.HResult:X8}: {ex.Message}");
+            return null;
+        }
     }
 
     private static BitmapImage CreateBitmapImage(
@@ -1101,9 +1337,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
         // For precise control over decode size, callers should set DecodePixelWidth/Height on the ImageEx control.
         if (targetWidth <= 0 && targetHeight <= 0)
         {
-            // Clamp DPI scale to reasonable bounds (0.5x - 4.0x) to prevent extreme decode sizes.
-            var clampedDpiScale = Math.Max(0.5, Math.Min(4.0, dpiScale));
-            targetWidth = (int)Math.Round(400 * clampedDpiScale);
+            targetWidth = ResolveFallbackDecodeWidth(dpiScale);
         }
 
         var bitmap = new BitmapImage
@@ -1116,6 +1350,13 @@ internal sealed partial class ImageExCacheManager : IDisposable
         if (targetHeight > 0) bitmap.DecodePixelHeight = targetHeight;
 
         return bitmap;
+    }
+
+    private static int ResolveFallbackDecodeWidth(double dpiScale)
+    {
+        // Clamp DPI scale to reasonable bounds (0.5x - 4.0x) to prevent extreme decode sizes.
+        var clampedDpiScale = Math.Max(0.5, Math.Min(4.0, dpiScale));
+        return (int)Math.Round(400 * clampedDpiScale);
     }
 
     private static Task<T?> RunOnDispatcherAsync<T>(DispatcherQueue? dispatcherQueue, Func<Task<T?>> factory)
