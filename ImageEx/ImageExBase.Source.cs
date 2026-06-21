@@ -349,7 +349,7 @@ namespace ImageEx
                 {
                     var img = await ProvideCachedResourceAsync(imageUri, requestToken);
 
-                    if (IsRequestCurrent(requestVersion, requestTokenSource, requestToken))
+                    if (CanAttachResolvedSource(requestVersion, requestTokenSource, requestToken, img))
                     {
                         // Only attach our image if this is still the active request
                         AttachSource(img);
@@ -366,7 +366,7 @@ namespace ImageEx
                         var bitmap = new BitmapImage();
                         await bitmap.SetSourceAsync(new MemoryStream(bytes).AsRandomAccessStream());
 
-                        if (IsRequestCurrent(requestVersion, requestTokenSource, requestToken))
+                        if (CanAttachResolvedSource(requestVersion, requestTokenSource, requestToken, bitmap))
                         {
                             AttachSource(bitmap);
                         }
@@ -374,9 +374,23 @@ namespace ImageEx
                 }
                 else
                 {
-                    AttachSource(GetDeterminedSource(imageUri));
+                    var determinedSource = GetDeterminedSource(imageUri);
+                    if (IsLoaded)
+                    {
+                        AttachSource(determinedSource);
+                    }
                 }
             }
+        }
+
+        private bool CanAttachResolvedSource(
+            long requestVersion,
+            CancellationTokenSource requestTokenSource,
+            CancellationToken requestToken,
+            ImageSource source)
+        {
+            return IsRequestCurrent(requestVersion, requestTokenSource, requestToken)
+                && (source == null || IsLoaded);
         }
 
         /// <summary>

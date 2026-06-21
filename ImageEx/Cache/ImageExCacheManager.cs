@@ -979,21 +979,18 @@ internal sealed partial class ImageExCacheManager : IDisposable
             try
             {
                 RecordDecodeStarted("file", fileInfo.Length, decodeWidth, decodeHeight, decodeType, isSvg);
-                var image = await RunOnDispatcherAsync(dispatcherQueue, async () =>
+                if (token.IsCancellationRequested)
                 {
-                    if (token.IsCancellationRequested)
+                    if (returnNullOnCancellation)
                     {
-                        if (returnNullOnCancellation)
-                        {
-                            return default;
-                        }
-
-                        token.ThrowIfCancellationRequested();
+                        return null;
                     }
 
-                    using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, bufferSize: 4096, FileOptions.SequentialScan);
-                    return await LoadFromStreamAsync(fileStream, isSvg, decodeWidth, decodeHeight, decodeType, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
-                }).ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
+                }
+
+                using var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete, bufferSize: 4096, FileOptions.SequentialScan);
+                var image = await LoadFromStreamAsync(fileStream, isSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
                 RecordDecodeCompleted("file", image != null);
                 return image;
             }
@@ -1055,11 +1052,8 @@ internal sealed partial class ImageExCacheManager : IDisposable
         try
         {
             RecordDecodeStarted("bytes", bytes.Length, decodeWidth, decodeHeight, decodeType, isSvg);
-            var image = await RunOnDispatcherAsync(dispatcherQueue, async () =>
-            {
-                using var memoryStream = new MemoryStream(bytes);
-                return await LoadFromStreamAsync(memoryStream, isSvg, decodeWidth, decodeHeight, decodeType, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
-            }).ConfigureAwait(false);
+            using var memoryStream = new MemoryStream(bytes);
+            var image = await LoadFromStreamAsync(memoryStream, isSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
             RecordDecodeCompleted("bytes", image != null);
             return image;
         }
@@ -1076,6 +1070,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
         int decodeWidth,
         int decodeHeight,
         DecodePixelType decodeType,
+        DispatcherQueue? dispatcherQueue,
         double dpiScale,
         CancellationToken token,
         bool returnNullOnCancellation)
@@ -1093,9 +1088,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
         if (isSvg)
         {
             using var svgStream = stream.AsRandomAccessStream();
-            var svg = new SvgImageSource();
-            await svg.SetSourceAsync(svgStream);
-            return svg;
+            return await LoadSvgImageOnDispatcherAsync(svgStream, dispatcherQueue, token, returnNullOnCancellation).ConfigureAwait(false);
         }
 
         if (token.IsCancellationRequested)
@@ -1123,6 +1116,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 bitmapStream,
                 dimensions.Value,
                 decodeType,
+                dispatcherQueue,
                 dpiScale,
                 token,
                 returnNullOnCancellation);
@@ -1135,9 +1129,15 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
 
         bitmapStream.Seek(0);
-        var bitmap = CreateBitmapImage(dimensions.Value.TargetWidth, dimensions.Value.TargetHeight, decodeType, dpiScale, BitmapCreateOptions.IgnoreImageCache);
-        await bitmap.SetSourceAsync(bitmapStream);
-        return bitmap;
+        return await LoadBitmapImageOnDispatcherAsync(
+            bitmapStream,
+            dimensions.Value.TargetWidth,
+            dimensions.Value.TargetHeight,
+            decodeType,
+            dispatcherQueue,
+            dpiScale,
+            token,
+            returnNullOnCancellation).ConfigureAwait(false);
     }
 
     private static bool ShouldPrescale(DecodeDimensions dimensions)
@@ -1224,6 +1224,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
         IRandomAccessStream sourceStream,
         DecodeDimensions dimensions,
         DecodePixelType decodeType,
+        DispatcherQueue? dispatcherQueue,
         double dpiScale,
         CancellationToken token,
         bool returnNullOnCancellation)
@@ -1294,14 +1295,12 @@ internal sealed partial class ImageExCacheManager : IDisposable
             }
 
             stage = "writeable-bitmap";
-            var bitmap = new WriteableBitmap(dimensions.TargetWidth, dimensions.TargetHeight);
-            using (var pixelBufferStream = bitmap.PixelBuffer.AsStream())
-            {
-                await pixelBufferStream.WriteAsync(pixels, 0, pixels.Length, token);
-            }
-
-            bitmap.Invalidate();
-            return bitmap;
+            return await CreateWriteableBitmapOnDispatcherAsync(
+                dispatcherQueue,
+                dimensions,
+                pixels,
+                token,
+                returnNullOnCancellation).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (returnNullOnCancellation)
         {
@@ -1317,6 +1316,88 @@ internal sealed partial class ImageExCacheManager : IDisposable
             Debug.WriteLine($"[ImageExCache] Failed to prescale image stream at {stage}: {ex.GetType().Name} HResult=0x{ex.HResult:X8}: {ex.Message}");
             return null;
         }
+    }
+
+    private static Task<ImageSource?> LoadSvgImageOnDispatcherAsync(
+        IRandomAccessStream svgStream,
+        DispatcherQueue? dispatcherQueue,
+        CancellationToken token,
+        bool returnNullOnCancellation)
+    {
+        return RunOnDispatcherAsync<ImageSource?>(dispatcherQueue, async () =>
+        {
+            if (token.IsCancellationRequested)
+            {
+                if (returnNullOnCancellation)
+                {
+                    return null;
+                }
+
+                token.ThrowIfCancellationRequested();
+            }
+
+            var svg = new SvgImageSource();
+            await svg.SetSourceAsync(svgStream);
+            return svg;
+        });
+    }
+
+    private static Task<ImageSource?> LoadBitmapImageOnDispatcherAsync(
+        IRandomAccessStream bitmapStream,
+        int decodeWidth,
+        int decodeHeight,
+        DecodePixelType decodeType,
+        DispatcherQueue? dispatcherQueue,
+        double dpiScale,
+        CancellationToken token,
+        bool returnNullOnCancellation)
+    {
+        return RunOnDispatcherAsync<ImageSource?>(dispatcherQueue, async () =>
+        {
+            if (token.IsCancellationRequested)
+            {
+                if (returnNullOnCancellation)
+                {
+                    return null;
+                }
+
+                token.ThrowIfCancellationRequested();
+            }
+
+            var bitmap = CreateBitmapImage(decodeWidth, decodeHeight, decodeType, dpiScale, BitmapCreateOptions.IgnoreImageCache);
+            await bitmap.SetSourceAsync(bitmapStream);
+            return bitmap;
+        });
+    }
+
+    private static Task<ImageSource?> CreateWriteableBitmapOnDispatcherAsync(
+        DispatcherQueue? dispatcherQueue,
+        DecodeDimensions dimensions,
+        byte[] pixels,
+        CancellationToken token,
+        bool returnNullOnCancellation)
+    {
+        return RunOnDispatcherAsync<ImageSource?>(dispatcherQueue, () =>
+        {
+            if (token.IsCancellationRequested)
+            {
+                if (returnNullOnCancellation)
+                {
+                    return null;
+                }
+
+                token.ThrowIfCancellationRequested();
+            }
+
+            var bitmap = new WriteableBitmap(dimensions.TargetWidth, dimensions.TargetHeight);
+            using (var pixelBufferStream = bitmap.PixelBuffer.AsStream())
+            {
+                pixelBufferStream.Write(pixels, 0, pixels.Length);
+            }
+
+            bitmap.Invalidate();
+            return bitmap;
+        });
     }
 
     private static BitmapImage CreateBitmapImage(
@@ -1359,6 +1440,33 @@ internal sealed partial class ImageExCacheManager : IDisposable
         return (int)Math.Round(400 * clampedDpiScale);
     }
 
+    private static Task<T?> RunOnDispatcherAsync<T>(DispatcherQueue? dispatcherQueue, Func<T?> factory)
+    {
+        if (dispatcherQueue == null || dispatcherQueue.HasThreadAccess)
+        {
+            return SafeFactoryCall(factory);
+        }
+
+        var tcs = new TaskCompletionSource<T?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!dispatcherQueue.TryEnqueue(() =>
+            {
+                try
+                {
+                    tcs.TrySetResult(factory());
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[ImageExCache] Failed to create image on UI thread: {ex.Message}");
+                    tcs.TrySetResult(default);
+                }
+            }))
+        {
+            tcs.TrySetResult(default);
+        }
+
+        return tcs.Task;
+    }
+
     private static Task<T?> RunOnDispatcherAsync<T>(DispatcherQueue? dispatcherQueue, Func<Task<T?>> factory)
     {
         if (dispatcherQueue == null || dispatcherQueue.HasThreadAccess)
@@ -1385,6 +1493,19 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
 
         return tcs.Task;
+    }
+
+    private static Task<T?> SafeFactoryCall<T>(Func<T?> factory)
+    {
+        try
+        {
+            return Task.FromResult(factory());
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[ImageExCache] Failed to decode image: {ex.Message}");
+            return Task.FromResult<T?>(default);
+        }
     }
 
     private static async Task<T?> SafeFactoryCall<T>(Func<Task<T?>> factory)
