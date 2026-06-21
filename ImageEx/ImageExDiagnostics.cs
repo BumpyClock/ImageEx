@@ -350,17 +350,9 @@ namespace ImageEx
 
         private static Uri? TryGetSourceUri(ImageSource? source)
         {
-            if (source == null)
-            {
-                return null;
-            }
-
-            return source switch
-            {
-                BitmapImage bitmap when ImageExDeferredBitmapSourceRegistry.TryGetDeferredUriSource(bitmap, out var uri) => uri,
-                SvgImageSource svg => svg.UriSource,
-                _ => null
-            };
+            return source != null && ImageExDeferredBitmapSourceRegistry.TryGetDeferredUriSource(source, out var uri)
+                ? uri
+                : null;
         }
 
         private static string GetUriExtension(Uri? uri)

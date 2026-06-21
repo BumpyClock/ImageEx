@@ -249,11 +249,6 @@ namespace ImageEx
             ImageExFailed?.Invoke(this, new ImageExFailedEventArgs(new Exception(e.ErrorMessage)));
         }
 
-        private void ImageExBase_Loaded(object sender, RoutedEventArgs e)
-        {
-            InvalidateLazyLoading();
-        }
-
         private void ImageExBase_EffectiveViewportChanged(FrameworkElement sender, EffectiveViewportChangedEventArgs args)
         {
             InvalidateLazyLoading(args.EffectiveViewport);
@@ -287,34 +282,13 @@ namespace ImageEx
 
             var controlRect = TransformToVisual(hostElement)
                 .TransformBounds(new Rect(0, 0, ActualWidth, ActualHeight));
-            var lazyLoadingThreshold = LazyLoadingThreshold;
-            var hostRect = new Rect(
-                0 - lazyLoadingThreshold,
-                0 - lazyLoadingThreshold,
-                hostElement.ActualWidth + (2 * lazyLoadingThreshold),
-                hostElement.ActualHeight + (2 * lazyLoadingThreshold));
+            var hostRect = ExpandLazyLoadingViewport(
+                0,
+                0,
+                hostElement.ActualWidth,
+                hostElement.ActualHeight);
 
-            if (controlRect.IntersectsWith(hostRect))
-            {
-                _isInViewport = true;
-
-                if (_lazyLoadingSource != null)
-                {
-                    var source = _lazyLoadingSource;
-                    _lazyLoadingSource = null;
-                    SetSource(source);
-                }
-            }
-            else
-            {
-                _isInViewport = false;
-                if (HasAttachedSource())
-                {
-                    ImageExDiagnostics.RecordOffscreenAttached(this);
-                }
-
-                SuspendSourceUntilViewport();
-            }
+            ApplyLazyLoadingViewportState(controlRect.IntersectsWith(hostRect));
         }
 
         private void InvalidateLazyLoading(Rect effectiveViewport)
@@ -325,15 +299,29 @@ namespace ImageEx
                 return;
             }
 
-            var lazyLoadingThreshold = LazyLoadingThreshold;
             var controlRect = new Rect(0, 0, ActualWidth, ActualHeight);
-            var viewportRect = new Rect(
-                effectiveViewport.X - lazyLoadingThreshold,
-                effectiveViewport.Y - lazyLoadingThreshold,
-                effectiveViewport.Width + (2 * lazyLoadingThreshold),
-                effectiveViewport.Height + (2 * lazyLoadingThreshold));
+            var viewportRect = ExpandLazyLoadingViewport(
+                effectiveViewport.X,
+                effectiveViewport.Y,
+                effectiveViewport.Width,
+                effectiveViewport.Height);
 
-            if (controlRect.IntersectsWith(viewportRect))
+            ApplyLazyLoadingViewportState(controlRect.IntersectsWith(viewportRect));
+        }
+
+        private Rect ExpandLazyLoadingViewport(double x, double y, double width, double height)
+        {
+            var lazyLoadingThreshold = LazyLoadingThreshold;
+            return new Rect(
+                x - lazyLoadingThreshold,
+                y - lazyLoadingThreshold,
+                width + (2 * lazyLoadingThreshold),
+                height + (2 * lazyLoadingThreshold));
+        }
+
+        private void ApplyLazyLoadingViewportState(bool isInViewport)
+        {
+            if (isInViewport)
             {
                 _isInViewport = true;
 
@@ -383,7 +371,6 @@ namespace ImageEx
                 return;
             }
 
-            Loaded += ImageExBase_Loaded;
             EffectiveViewportChanged += ImageExBase_EffectiveViewportChanged;
             _lazyLoadingHandlersAttached = true;
         }
@@ -395,7 +382,6 @@ namespace ImageEx
                 return;
             }
 
-            Loaded -= ImageExBase_Loaded;
             EffectiveViewportChanged -= ImageExBase_EffectiveViewportChanged;
             _lazyLoadingHandlersAttached = false;
         }

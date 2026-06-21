@@ -45,7 +45,6 @@ internal static class ImageExDeferredBitmapSourceRegistry
             bitmap.DecodePixelHeight = decodeHeight;
         }
 
-        s_deferredUriSources.Remove(bitmap);
         s_deferredUriSources.Add(bitmap, new DeferredUriSource(uri));
         return bitmap;
     }
