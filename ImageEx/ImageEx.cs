@@ -4,6 +4,7 @@
 
 using ImageEx.Cache;
 using Microsoft.UI.Dispatching;
+using System.Diagnostics;
 
 namespace ImageEx
 {
@@ -56,13 +57,19 @@ namespace ImageEx
             // Get DPI scale for adaptive decode sizing (defaults to 1.0 if XamlRoot not available)
             var dpiScale = XamlRoot?.RasterizationScale ?? 1.0;
 
+            var dispatcherQueue = ImageDispatcherQueue;
+            if (dispatcherQueue == null)
+            {
+                Debug.WriteLine($"[ImageEx] Dispatcher unavailable for {imageUri}; disk-cache UI decode skipped.");
+            }
+
             var result = await manager.GetOrLoadImageAsync(
                 imageUri,
                 DecodePixelWidth,
                 DecodePixelHeight,
                 DecodePixelType,
                 token,
-                DispatcherQueue,
+                dispatcherQueue,
                 dpiScale,
                 returnNullOnCancellation: true);
 

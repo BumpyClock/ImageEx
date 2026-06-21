@@ -5,6 +5,7 @@
 // ReSharper disable MemberCanBePrivate.Global
 
 using CommunityToolkit.WinUI;
+using Microsoft.UI.Dispatching;
 
 namespace ImageEx
 {
@@ -45,6 +46,7 @@ namespace ImageEx
         private bool _isInViewport;
         private bool _lazyLoadingHandlersAttached;
         private ImageSource _currentImageSource;
+        private readonly DispatcherQueue _creationDispatcherQueue;
         private long _diagnosticAttachedSourceBytes;
 
         /// <summary>
@@ -89,7 +91,12 @@ namespace ImageEx
         /// Initializes a new instance of the <see cref="ImageExBase"/> class.
         /// </summary>
         // ReSharper disable once PublicConstructorInAbstractClass
-        public ImageExBase() { }
+        public ImageExBase()
+        {
+            _creationDispatcherQueue = DispatcherQueue.GetForCurrentThread();
+        }
+
+        protected DispatcherQueue ImageDispatcherQueue => DispatcherQueue ?? _creationDispatcherQueue;
 
         private void ModifyImageHandler(Action<Image> imageHandlerUpdate, Action<ImageBrush> brushHandlerUpdate)
         {
@@ -348,19 +355,14 @@ namespace ImageEx
         {
             if (!EnableLazyLoading
                 || Source == null
-                || _lazyLoadingSource != null)
+                || _lazyLoadingSource != null
+                || HasAttachedSource())
             {
                 return;
             }
 
-            var hadAttachedSource = HasAttachedSource();
             _lazyLoadingSource = Source;
             AttachLazyLoadingHandlers();
-            if (hadAttachedSource)
-            {
-                ImageExDiagnostics.RecordOffscreenDetach(this);
-            }
-
             SetSource(null);
         }
 

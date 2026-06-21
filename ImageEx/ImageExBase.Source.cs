@@ -165,10 +165,14 @@ namespace ImageEx
         /// <param name="source"><see cref="ImageSource"/> to assign to the image.</param>
         private void AttachSource(ImageSource source)
         {
-            var dispatcherQueue = DispatcherQueue;
+            var dispatcherQueue = ImageDispatcherQueue;
             if (dispatcherQueue is { HasThreadAccess: false })
             {
-                dispatcherQueue.TryEnqueue(() => AttachSource(source));
+                if (!dispatcherQueue.TryEnqueue(() => AttachSource(source)))
+                {
+                    return;
+                }
+
                 return;
             }
 

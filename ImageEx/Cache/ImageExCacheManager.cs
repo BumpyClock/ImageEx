@@ -1102,17 +1102,17 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
 
         using var bitmapStream = stream.AsRandomAccessStream();
-        var dimensions = await ResolveDecodeDimensionsAsync(bitmapStream, decodeWidth, decodeHeight, dpiScale, token, returnNullOnCancellation);
+        var dimensions = await ResolveDecodeDimensionsAsync(bitmapStream, decodeWidth, decodeHeight, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
         if (dimensions == null)
         {
             return null;
         }
 
-        if (ShouldPrescale(dimensions.Value))
+        if (CanDecodeToWriteableBitmap(dimensions.Value))
         {
             bitmapStream.Seek(0);
 
-            var prescaledBitmap = await CreatePrescaledBitmapAsync(
+            var decodedBitmap = await CreatePrescaledBitmapAsync(
                 bitmapStream,
                 dimensions.Value,
                 decodeType,
@@ -1120,34 +1120,24 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 dpiScale,
                 token,
                 returnNullOnCancellation);
-            if (prescaledBitmap == null)
+            if (decodedBitmap == null)
             {
                 return null;
             }
 
-            return prescaledBitmap;
+            return decodedBitmap;
         }
 
-        bitmapStream.Seek(0);
-        return await LoadBitmapImageOnDispatcherAsync(
-            bitmapStream,
-            dimensions.Value.TargetWidth,
-            dimensions.Value.TargetHeight,
-            decodeType,
-            dispatcherQueue,
-            dpiScale,
-            token,
-            returnNullOnCancellation).ConfigureAwait(false);
+        return null;
     }
 
-    private static bool ShouldPrescale(DecodeDimensions dimensions)
+    private static bool CanDecodeToWriteableBitmap(DecodeDimensions dimensions)
     {
+        // Avoid BitmapImage retaining a stream adapter beyond SetSourceAsync.
         return dimensions.TargetWidth > 0 &&
             dimensions.TargetHeight > 0 &&
             dimensions.NaturalWidth > 0 &&
-            dimensions.NaturalHeight > 0 &&
-            dimensions.TargetWidth < dimensions.NaturalWidth &&
-            dimensions.TargetHeight < dimensions.NaturalHeight;
+            dimensions.NaturalHeight > 0;
     }
 
     private static async Task<DecodeDimensions?> ResolveDecodeDimensionsAsync(
@@ -1170,7 +1160,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
 
         try
         {
-            var decoder = await BitmapDecoder.CreateAsync(stream);
+            var decoder = await BitmapDecoder.CreateAsync(stream).AsTask().ConfigureAwait(false);
             var naturalWidth = (int)decoder.OrientedPixelWidth;
             var naturalHeight = (int)decoder.OrientedPixelHeight;
             if (naturalWidth <= 0 || naturalHeight <= 0)
@@ -1243,7 +1233,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
         try
         {
             stage = "decoder-create";
-            var decoder = await BitmapDecoder.CreateAsync(sourceStream).AsTask(token);
+            var decoder = await BitmapDecoder.CreateAsync(sourceStream).AsTask().ConfigureAwait(false);
             var sourceWidth = (int)decoder.PixelWidth;
             var sourceHeight = (int)decoder.PixelHeight;
             var orientationSwapsAxes = sourceWidth > 0 &&
@@ -1270,7 +1260,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 BitmapAlphaMode.Premultiplied,
                 transform,
                 ExifOrientationMode.RespectExifOrientation,
-                ColorManagementMode.DoNotColorManage).AsTask(token);
+                ColorManagementMode.DoNotColorManage).AsTask().ConfigureAwait(false);
 
             var pixels = pixelData.DetachPixelData();
             var expectedBytes = checked(dimensions.TargetWidth * dimensions.TargetHeight * 4);
@@ -1442,7 +1432,13 @@ internal sealed partial class ImageExCacheManager : IDisposable
 
     private static Task<T?> RunOnDispatcherAsync<T>(DispatcherQueue? dispatcherQueue, Func<T?> factory)
     {
-        if (dispatcherQueue == null || dispatcherQueue.HasThreadAccess)
+        if (dispatcherQueue == null)
+        {
+            Debug.WriteLine("[ImageExCache] UI image creation skipped because dispatcher is unavailable.");
+            return Task.FromResult<T?>(default);
+        }
+
+        if (dispatcherQueue.HasThreadAccess)
         {
             return SafeFactoryCall(factory);
         }
@@ -1461,6 +1457,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 }
             }))
         {
+            Debug.WriteLine("[ImageExCache] UI image creation skipped because dispatcher enqueue failed.");
             tcs.TrySetResult(default);
         }
 
@@ -1469,7 +1466,13 @@ internal sealed partial class ImageExCacheManager : IDisposable
 
     private static Task<T?> RunOnDispatcherAsync<T>(DispatcherQueue? dispatcherQueue, Func<Task<T?>> factory)
     {
-        if (dispatcherQueue == null || dispatcherQueue.HasThreadAccess)
+        if (dispatcherQueue == null)
+        {
+            Debug.WriteLine("[ImageExCache] UI image creation skipped because dispatcher is unavailable.");
+            return Task.FromResult<T?>(default);
+        }
+
+        if (dispatcherQueue.HasThreadAccess)
         {
             return SafeFactoryCall(factory);
         }
@@ -1489,6 +1492,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 }
             }))
         {
+            Debug.WriteLine("[ImageExCache] UI image creation skipped because dispatcher enqueue failed.");
             tcs.TrySetResult(default);
         }
 
