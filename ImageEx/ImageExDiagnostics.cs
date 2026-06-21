@@ -8,6 +8,7 @@ using System.IO;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Media.Imaging;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace ImageEx
 {
@@ -300,39 +301,51 @@ namespace ImageEx
 
         private static void LogSourceEvent(ImageExBase control, string context, ImageSource? source, long sourceDecodedBytes)
         {
-            var bitmap = source as BitmapImage;
-            var pixelWidth = 0;
-            var pixelHeight = 0;
-            if (source is BitmapSource bitmapSource)
+            try
             {
-                pixelWidth = bitmapSource.PixelWidth;
-                pixelHeight = bitmapSource.PixelHeight;
-            }
-            var decodeWidth = bitmap?.DecodePixelWidth ?? 0;
-            var decodeHeight = bitmap?.DecodePixelHeight ?? 0;
-            var decodeType = bitmap?.DecodePixelType.ToString() ?? string.Empty;
-            var sourceType = source?.GetType().Name ?? string.Empty;
-            var uri = TryGetSourceUri(source);
-            var activeDecodedBytes = Interlocked.Read(ref s_activeAttachedDecodedBytes);
+                if (control.DispatcherQueue is { HasThreadAccess: false })
+                {
+                    return;
+                }
 
-            Debug.WriteLine(
-                "[ImageExDiagnostics] " +
-                $"Context={context} " +
-                $"ControlType={control.GetType().Name} " +
-                $"SourceType={sourceType} " +
-                $"UriScheme={uri?.Scheme ?? string.Empty} " +
-                $"UriHost={uri?.Host ?? string.Empty} " +
-                $"UriExtension={GetUriExtension(uri)} " +
-                $"PixelWidth={pixelWidth} " +
-                $"PixelHeight={pixelHeight} " +
-                $"DecodePixelWidth={decodeWidth} " +
-                $"DecodePixelHeight={decodeHeight} " +
-                $"DecodePixelType={decodeType} " +
-                $"IsLoaded={control.IsLoaded} " +
-                $"EnableLazyLoading={control.EnableLazyLoading} " +
-                $"InViewport={control.IsInViewport} " +
-                $"SourceDecodedMB={ToMegabytes(sourceDecodedBytes):F1} " +
-                $"ActiveDecodedMB={ToMegabytes(activeDecodedBytes):F1}");
+                var bitmap = source as BitmapImage;
+                var pixelWidth = 0;
+                var pixelHeight = 0;
+                if (source is BitmapSource bitmapSource)
+                {
+                    pixelWidth = bitmapSource.PixelWidth;
+                    pixelHeight = bitmapSource.PixelHeight;
+                }
+                var decodeWidth = bitmap?.DecodePixelWidth ?? 0;
+                var decodeHeight = bitmap?.DecodePixelHeight ?? 0;
+                var decodeType = bitmap?.DecodePixelType.ToString() ?? string.Empty;
+                var sourceType = source?.GetType().Name ?? string.Empty;
+                var uri = TryGetSourceUri(source);
+                var activeDecodedBytes = Interlocked.Read(ref s_activeAttachedDecodedBytes);
+
+                Debug.WriteLine(
+                    "[ImageExDiagnostics] " +
+                    $"Context={context} " +
+                    $"ControlType={control.GetType().Name} " +
+                    $"SourceType={sourceType} " +
+                    $"UriScheme={uri?.Scheme ?? string.Empty} " +
+                    $"UriHost={uri?.Host ?? string.Empty} " +
+                    $"UriExtension={GetUriExtension(uri)} " +
+                    $"PixelWidth={pixelWidth} " +
+                    $"PixelHeight={pixelHeight} " +
+                    $"DecodePixelWidth={decodeWidth} " +
+                    $"DecodePixelHeight={decodeHeight} " +
+                    $"DecodePixelType={decodeType} " +
+                    $"IsLoaded={control.IsLoaded} " +
+                    $"EnableLazyLoading={control.EnableLazyLoading} " +
+                    $"InViewport={control.IsInViewport} " +
+                    $"SourceDecodedMB={ToMegabytes(sourceDecodedBytes):F1} " +
+                    $"ActiveDecodedMB={ToMegabytes(activeDecodedBytes):F1}");
+            }
+            catch (Exception ex) when (ex is COMException or InvalidOperationException)
+            {
+                // Diagnostic logging must not fail image lifecycle paths.
+            }
         }
 
         private static Uri? TryGetSourceUri(ImageSource? source)

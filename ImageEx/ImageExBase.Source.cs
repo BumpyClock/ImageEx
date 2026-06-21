@@ -165,6 +165,18 @@ namespace ImageEx
         /// <param name="source"><see cref="ImageSource"/> to assign to the image.</param>
         private void AttachSource(ImageSource source)
         {
+            var dispatcherQueue = DispatcherQueue;
+            if (dispatcherQueue is { HasThreadAccess: false })
+            {
+                dispatcherQueue.TryEnqueue(() => AttachSource(source));
+                return;
+            }
+
+            if (source != null && !IsLoaded)
+            {
+                return;
+            }
+
             var previousSource = _currentImageSource;
             var nextDecodedBytes = ImageExDiagnostics.EstimateDecodedBytes(source);
             ImageExDiagnostics.RecordAttach(
@@ -192,9 +204,12 @@ namespace ImageEx
 
             if (source == null)
             {
-                VisualStateManager.GoToState(this, UnloadedState, true);
+                if (IsLoaded)
+                {
+                    VisualStateManager.GoToState(this, UnloadedState, true);
+                }
             }
-            else if (source is BitmapSource { PixelHeight: > 0, PixelWidth: > 0 })
+            else if (IsLoaded && source is BitmapSource { PixelHeight: > 0, PixelWidth: > 0 })
             {
                 UpdateDiagnosticAttachedSourceBytes();
                 VisualStateManager.GoToState(this, LoadedState, true);
@@ -246,6 +261,11 @@ namespace ImageEx
                 var previousTokenSource = _tokenSource;
                 _tokenSource = null;
 
+                if (source == null)
+                {
+                    AttachSource(null);
+                }
+
                 if (previousTokenSource != null)
                 {
                     if (!previousTokenSource.Token.IsCancellationRequested)
@@ -260,14 +280,14 @@ namespace ImageEx
                     return;
                 }
 
-                AttachSource(null);
-
                 if (source == null)
                 {
                     // No new request to track. _tokenSource stays null so any in-flight result
                     // from the previous request cannot attach.
                     return;
                 }
+
+                AttachSource(null);
 
                 var newTokenSource = new CancellationTokenSource();
                 _tokenSource = newTokenSource;
