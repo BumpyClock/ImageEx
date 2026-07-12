@@ -3,3 +3,4 @@ using System.Runtime.InteropServices;
 
 [assembly: ComVisible(false)]
 [assembly: InternalsVisibleTo("Digests.UI.Tests")]
+[assembly: InternalsVisibleTo("Digests.WinUI.HostedTests")]
