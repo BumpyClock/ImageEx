@@ -317,7 +317,15 @@ internal sealed partial class ImageExCacheManager : IDisposable
 
                     if (image != null)
                     {
-                        StoreSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, cachedIsSvg, dpiScale, image);
+                        await StoreSmallDecodedImageAsync(
+                            uri,
+                            decodeWidth,
+                            decodeHeight,
+                            decodeType,
+                            cachedIsSvg,
+                            dpiScale,
+                            image,
+                            dispatcherQueue).ConfigureAwait(false);
                         _diskCache.UpdateAccessTime(cacheKey);
                         // Fire-and-forget to persist LRU update
                         _ = Task.Run(async () =>
@@ -427,7 +435,15 @@ internal sealed partial class ImageExCacheManager : IDisposable
         var loadedImage = await LoadFromBytesAsync(result.Bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
         if (loadedImage != null)
         {
-            StoreSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, detectedSvg, dpiScale, loadedImage);
+            await StoreSmallDecodedImageAsync(
+                uri,
+                decodeWidth,
+                decodeHeight,
+                decodeType,
+                detectedSvg,
+                dpiScale,
+                loadedImage,
+                dispatcherQueue).ConfigureAwait(false);
         }
 
         return new CacheResult(loadedImage, WasCacheHit: false);
@@ -443,7 +459,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
         out ImageSource? image)
     {
         image = null;
-        if (!TryEstimateDecodedImageCacheBytes(decodeWidth, decodeHeight, isSvg, out _))
+        if (isSvg || (decodeWidth <= 0 && decodeHeight <= 0))
         {
             return false;
         }
@@ -463,16 +479,31 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
     }
 
-    private void StoreSmallDecodedImage(
+    private async Task StoreSmallDecodedImageAsync(
         Uri uri,
         int decodeWidth,
         int decodeHeight,
         DecodePixelType decodeType,
         bool isSvg,
         double dpiScale,
-        ImageSource image)
+        ImageSource image,
+        DispatcherQueue? dispatcherQueue)
     {
-        if (!TryEstimateDecodedImageCacheBytes(decodeWidth, decodeHeight, isSvg, out var sizeBytes))
+        if (isSvg)
+        {
+            return;
+        }
+
+        var resolvedDimensions = await RunOnDispatcherAsync<int[]>(dispatcherQueue, () =>
+            image is BitmapSource { PixelWidth: > 0, PixelHeight: > 0 } bitmapSource
+                ? new[] { bitmapSource.PixelWidth, bitmapSource.PixelHeight }
+                : null).ConfigureAwait(false);
+        if (resolvedDimensions is null
+            || !TryEstimateDecodedImageCacheBytes(
+                resolvedDimensions[0],
+                resolvedDimensions[1],
+                isSvg,
+                out var sizeBytes))
         {
             return;
         }
@@ -509,30 +540,25 @@ internal sealed partial class ImageExCacheManager : IDisposable
         }
     }
 
-    internal static bool TryEstimateDecodedImageCacheBytes(int decodeWidth, int decodeHeight, bool isSvg, out long sizeBytes)
+    internal static bool TryEstimateDecodedImageCacheBytes(
+        int resolvedWidth,
+        int resolvedHeight,
+        bool isSvg,
+        out long sizeBytes)
     {
         sizeBytes = 0;
-        if (isSvg)
+        if (isSvg || resolvedWidth <= 0 || resolvedHeight <= 0)
         {
             return false;
         }
 
-        if (decodeWidth <= 0 && decodeHeight <= 0)
+        sizeBytes = (long)resolvedWidth * resolvedHeight * 4;
+        if (resolvedWidth > MaxSmallDecodedImageCacheDimension ||
+            resolvedHeight > MaxSmallDecodedImageCacheDimension)
         {
             return false;
         }
 
-        var estimateWidth = decodeWidth > 0 ? decodeWidth : decodeHeight;
-        var estimateHeight = decodeHeight > 0 ? decodeHeight : decodeWidth;
-        if (estimateWidth <= 0 ||
-            estimateHeight <= 0 ||
-            estimateWidth > MaxSmallDecodedImageCacheDimension ||
-            estimateHeight > MaxSmallDecodedImageCacheDimension)
-        {
-            return false;
-        }
-
-        sizeBytes = (long)estimateWidth * estimateHeight * 4;
         return sizeBytes <= MaxSmallDecodedImageCacheEntryBytes;
     }
 
