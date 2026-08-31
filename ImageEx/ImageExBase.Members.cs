@@ -9,7 +9,7 @@ using Microsoft.UI.Composition;
 namespace ImageEx
 {
     /// <summary>
-    /// Base Code for ImageEx
+    /// Base implementation for ImageEx.
     /// </summary>
     public partial class ImageExBase
     {
@@ -106,7 +106,7 @@ namespace ImageEx
         internal bool HasLazyLoadingHandlersForDiagnostics => _lazyLoadingHandlersAttached;
 
         /// <summary>
-        /// Gets or sets DecodePixelHeight for underlying bitmap
+        /// Gets or sets the decode pixel height for the underlying bitmap.
         /// </summary>
         public int DecodePixelHeight
         {
@@ -115,7 +115,7 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Gets or sets DecodePixelType for underlying bitmap
+        /// Gets or sets the decode pixel type for the underlying bitmap.
         /// </summary>
         public DecodePixelType DecodePixelType
         {
@@ -124,7 +124,7 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Gets or sets DecodePixelWidth for underlying bitmap
+        /// Gets or sets the decode pixel width for the underlying bitmap.
         /// </summary>
         public int DecodePixelWidth
         {
@@ -133,7 +133,7 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Gets or sets the stretch behavior of the image
+        /// Gets or sets the stretch behavior of the image.
         /// </summary>
         public Stretch Stretch
         {
@@ -142,7 +142,7 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Gets or sets a value indicating whether it gets or sets cache state
+        /// Gets or sets whether the control uses its cache.
         /// </summary>
         public bool IsCacheEnabled
         {
@@ -151,7 +151,7 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Gets or sets a value indicating whether it gets or sets is lazy loading enable. (17763 or higher supported)
+        /// Gets or sets whether lazy loading is enabled. Supported on Windows 10 build 17763 and later.
         /// </summary>
         /// <remarks>Windows 10 build 17763 or higher required.</remarks>
         public bool EnableLazyLoading
@@ -161,7 +161,7 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Gets or sets a value indicating the threshold for triggering lazy loading.
+        /// Gets or sets the threshold that triggers lazy loading.
         /// </summary>
         public double LazyLoadingThreshold
         {
@@ -181,10 +181,10 @@ namespace ImageEx
         /// <summary>
         /// Gets or sets a value indicating whether disk caching is enabled.
         /// When true (default), images are cached to local storage.
-        /// When false, uses the base memory-only caching via BitmapImage.
+        /// When false, the control uses the base memory-only cache through BitmapImage.
         /// </summary>
         /// <remarks>
-        /// This property only has effect when <see cref="IsCacheEnabled"/> is true.
+        /// This property has an effect only when <see cref="IsCacheEnabled"/> is true.
         /// </remarks>
         public bool EnableDiskCache
         {
@@ -194,7 +194,7 @@ namespace ImageEx
 
         /// <summary>
         /// Gets or sets the maximum age in days for cached images.
-        /// Images older than this will be evicted on next cleanup.
+        /// The next cleanup evicts older images.
         /// </summary>
         public int DiskCacheDays
         {

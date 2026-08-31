@@ -1,7 +1,6 @@
-# ImageEx - Extended Image Control for UWP and WinUI apps
-The ImageEx control extends the standard image platform control, improving the performance and responsiveness of your applications.
-The source images are loaded asynchronously, and a loading indicator is displayed during execution.
-After downloading, the original image is saved in the local cache of the application to save resources and loading time the next time the image is displayed.
+# ImageEx: extended image control for UWP and WinUI apps
+
+The ImageEx control extends the platform Image control. It loads source images asynchronously and shows a loading indicator during the load. It saves downloaded images in the app's local cache so later loads use fewer resources and finish sooner.
 
 ImageEx accepts at most 8 MiB of source bytes for each raster or SVG response. It rejects larger declared responses before reading and stops chunked responses at the limit.
 

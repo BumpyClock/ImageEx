@@ -20,8 +20,8 @@ namespace ImageEx.Cache;
 /// in-flight deduplication, and cleanup orchestration.
 /// </summary>
 /// <remarks>
-/// This is a static singleton and is typically kept for app lifetime.
-/// It still implements <see cref="IDisposable"/> so tests or explicit host shutdown can flush/tear down resources deterministically.
+/// This class uses a static singleton and typically lives for the app lifetime.
+/// It also implements <see cref="IDisposable"/> so tests and explicit host shutdown can flush and tear down resources deterministically.
 /// </remarks>
 internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposable
 {
@@ -129,10 +129,10 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     }
 
     /// <summary>
-    /// Result of a cache lookup, including whether it was a cache hit for shimmer skip.
+    /// Result of a cache lookup, including whether the result came from disk and can skip the shimmer.
     /// </summary>
     /// <param name="Image">The loaded ImageSource, or null on failure.</param>
-    /// <param name="WasCacheHit">True if served from disk cache (skip shimmer).</param>
+    /// <param name="WasCacheHit">True when the result came from the disk cache and can skip the shimmer.</param>
     public record CacheResult(ImageSource? Image, bool WasCacheHit);
 
     internal readonly record struct ImageExCacheDiagnosticsSnapshot(
@@ -294,7 +294,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 return CancelledResult(token, returnNullOnCancellation);
             }
 
-        // Skip non-http URIs - return null to let base pipeline handle
+        // Skip non-HTTP URIs. Return null so the base pipeline handles them.
         if (!uri.IsHttpUri())
             return new CacheResult(null, false);
 
@@ -310,7 +310,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
         await _diskCache.EnsureMetadataLoadedAsync().ConfigureAwait(false);
 
-        // 1. Try local cache
+        // Try the local cache.
         var hasCacheEntry = _diskCache.TryGetEntry(cacheKey, out var entry) && entry != null;
         if (!hasCacheEntry)
         {
@@ -372,13 +372,13 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 }
                 catch
                 {
-                    // Corrupt file - delete and re-download
+                    // The file is corrupt. Delete it and download the source again.
                     RemoveCacheEntryIfDeleted(cacheKey, filePath);
                 }
             }
             else
             {
-                // Expired - clean up
+                // The entry is expired. Remove it during cleanup.
                 var expiredPath = _diskCache.GetFilePath(cacheKey, entry.Extension);
                 RemoveCacheEntryIfDeleted(cacheKey, expiredPath);
             }
@@ -431,10 +431,10 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         }
         catch
         {
-            // Disk save failed - still return image from memory
+            // The disk save failed. Return the image from memory.
         }
 
-        // 4. Return image from downloaded bytes
+        // Return an image from the downloaded bytes.
         var loadedImage = await LoadFromBytesAsync(result.Bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
         if (loadedImage != null)
         {
@@ -789,7 +789,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 }
                 catch
                 {
-                    // Permanent failure or last attempt - bail out
+                    // Return after a permanent failure or the last attempt.
                     RecordDownloadFailed(uri);
                     return new DownloadResult(null, null);
                 }
@@ -914,7 +914,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             }
             catch (IOException)
             {
-                // A racing decode/cleanup can touch old cache files. Skip and let download fill source cache.
+                // A concurrent decode or cleanup can touch old cache files. Let the download fill the source cache.
             }
             catch (UnauthorizedAccessException)
             {
@@ -1540,12 +1540,11 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         var targetWidth = decodeWidth;
         var targetHeight = decodeHeight;
 
-        // VISUAL QUALITY & MEMORY TARGET:
-        // When no explicit decode size is provided, use a DPI-aware fallback to balance quality and memory.
-        // Base size of 400px @ 1x DPI provides good quality for typical UI scenarios (feed images, thumbnails).
-        // Scales linearly with DPI: 1.0x=400px, 1.5x=600px, 2.0x=800px, 3.0x=1200px.
-        // This avoids both full-resolution memory bloat and visible pixelation on high-DPI displays.
-        // For precise control over decode size, callers should set DecodePixelWidth/Height on the ImageEx control.
+        // Use a DPI-aware fallback when no decode size is provided.
+        // A 400-pixel base size at 1x DPI balances quality and memory for feed images and thumbnails.
+        // Scale the fallback linearly with DPI: 1.0x=400px, 1.5x=600px, 2.0x=800px, 3.0x=1200px.
+        // This avoids full-resolution memory use and visible pixelation on high-DPI displays.
+        // Set DecodePixelWidth or DecodePixelHeight on ImageEx for precise decode control.
         if (targetWidth <= 0 && targetHeight <= 0)
         {
             targetWidth = ResolveFallbackDecodeWidth(dpiScale);
@@ -1565,7 +1564,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
     private static int ResolveFallbackDecodeWidth(double dpiScale)
     {
-        // Clamp DPI scale to reasonable bounds (0.5x - 4.0x) to prevent extreme decode sizes.
+        // Clamp the DPI scale to 0.5x through 4.0x to prevent extreme decode sizes.
         var clampedDpiScale = Math.Max(0.5, Math.Min(4.0, dpiScale));
         return (int)Math.Round(400 * clampedDpiScale);
     }
@@ -1961,7 +1960,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         }
         catch
         {
-            // Best-effort diagnostic only.
+            // Diagnostic only. Ignore failures.
         }
 
         return (ToMegabytes(managedBytes), ToMegabytes(workingSetBytes), ToMegabytes(privateBytes));
@@ -1987,7 +1986,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             var removed = 0;
             long freedBytes = 0;
 
-            // Initial size scan if needed
+            // Scan the initial size when needed.
             if (!_initialSizeScanned)
             {
                 await _diskCache.EnsureMetadataLoadedAsync().ConfigureAwait(false);

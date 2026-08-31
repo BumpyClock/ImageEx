@@ -90,7 +90,7 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
     {
         if (isSvg) return ".svg";
 
-        // Prefer content-type over URI extension (handles extensionless URLs)
+        // Prefer the Content-Type header over the URI extension for extensionless URLs.
         if (!string.IsNullOrEmpty(contentType))
         {
             var ext = contentType.ToLowerInvariant() switch
@@ -106,7 +106,7 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
             if (ext != null) return ext;
         }
 
-        // Fallback to URI extension
+        // Fall back to the URI extension.
         var uriExt = Path.GetExtension(uri.AbsolutePath).ToLowerInvariant();
         return uriExt switch
         {
@@ -147,7 +147,7 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
                 }
                 catch
                 {
-                    // Corrupt metadata - start fresh
+                    // The metadata is corrupt. Start with an empty cache.
                 }
             }
             _loaded = true;
@@ -452,7 +452,7 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
         }
         catch
         {
-            // Best effort - caller decides whether metadata can be removed.
+            // Ignore errors. The caller decides whether to remove the metadata.
             return false;
         }
     }

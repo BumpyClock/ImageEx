@@ -301,7 +301,7 @@ namespace ImageEx
             }
             catch
             {
-                // Best-effort diagnostic only.
+                // Diagnostic only. Ignore failures.
             }
 
             return (ToMegabytes(managedBytes), ToMegabytes(workingSetBytes), ToMegabytes(privateBytes));

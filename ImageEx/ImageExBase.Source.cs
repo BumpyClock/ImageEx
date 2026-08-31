@@ -6,7 +6,7 @@
 namespace ImageEx
 {
     /// <summary>
-    /// Base code for ImageEx
+    /// Base implementation for ImageEx.
     /// </summary>
     public partial class ImageExBase
     {
@@ -15,14 +15,14 @@ namespace ImageEx
         /// </summary>
         public static readonly DependencyProperty SourceProperty = DependencyProperty.Register(nameof(Source), typeof(object), typeof(ImageExBase), new PropertyMetadata(null, SourceChanged));
 
-        //// Used to track if we get a new request, so we can cancel any potential custom cache loading.
+        // Tracks new requests so the control can cancel custom cache loads.
         private CancellationTokenSource _tokenSource;
         private long _sourceRequestVersion;
 
         private object _lazyLoadingSource;
 
         /// <summary>
-        /// Gets or sets the source used by the image
+        /// Gets or sets the source used by the image.
         /// </summary>
         public object Source
         {
@@ -116,7 +116,7 @@ namespace ImageEx
                 }
                 catch (ObjectDisposedException)
                 {
-                    // Already disposed, ignore
+                    // The object is disposed. Ignore the callback.
                 }
                 finally
                 {
@@ -164,7 +164,7 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Method to call to assign an <see cref="ImageSource"/> value to the underlying <see cref="Image"/> powering <see cref="ImageExBase"/>.
+        /// Assigns an <see cref="ImageSource"/> to the underlying <see cref="Image"/> in <see cref="ImageExBase"/>.
         /// </summary>
         /// <param name="source"><see cref="ImageSource"/> to assign to the image.</param>
         private void AttachSource(ImageSource source)
@@ -196,9 +196,9 @@ namespace ImageEx
             _currentImageSource = source;
             _diagnosticAttachedSourceBytes = source == null ? 0 : nextDecodedBytes;
 
-            // Setting the source at this point should call ImageExOpened/VisualStateManager.GoToState
-            // as we register to both the ImageOpened/ImageFailed events of the underlying control.
-            // We only need to call those methods if we fail in other cases before we get here.
+            // Setting the source here raises ImageOpened or ImageFailed because the control
+            // registers handlers for both events. Call those methods directly only when another
+            // path fails before it sets the source.
             if (Image is Image image)
             {
                 image.Source = source;
@@ -263,9 +263,9 @@ namespace ImageEx
                     return;
                 }
 
-                // Cancel any in-flight previous request, then clear the field. A null
-                // _tokenSource signals no active request; any in-flight result from a prior
-                // request will fail the IsRequestCurrent guard in LoadImageAsync.
+                // Cancel the previous request and clear the field. A null _tokenSource
+                // means no request is active. An earlier result then fails the
+                // IsRequestCurrent guard in LoadImageAsync.
                 var previousTokenSource = _tokenSource;
                 _tokenSource = null;
 
@@ -290,8 +290,8 @@ namespace ImageEx
 
                 if (source == null)
                 {
-                    // No new request to track. _tokenSource stays null so any in-flight result
-                    // from the previous request cannot attach.
+                    // No new request needs tracking. Keep _tokenSource null so an earlier
+                    // result cannot attach.
                     return;
                 }
 
@@ -332,7 +332,7 @@ namespace ImageEx
             }
             catch (OperationCanceledException)
             {
-                // Nothing to do as cancellation has been requested
+                // Cancellation was requested. There is nothing to do.
             }
             catch (Exception e)
             {
@@ -379,7 +379,7 @@ namespace ImageEx
 
                     if (CanAttachResolvedSource(requestVersion, requestTokenSource, requestToken, img))
                     {
-                        // Only attach our image if this is still the active request
+                        // Attach the image only while this request remains active.
                         AttachSource(img);
                     }
                 }
@@ -422,10 +422,10 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Returns true when <paramref name="requestTokenSource"/> still represents the active
-        /// request (i.e. it has not been superseded by a newer Source change, null assignment,
-        /// or unload) and has not been cancelled. Used to gate stale attaches and visual-state
-        /// transitions on async completion paths.
+        /// Returns true when <paramref name="requestTokenSource"/> still represents the active request.
+        /// A newer Source change, a null assignment, or unload can supersede a request.
+        /// The method also checks cancellation before async completion paths attach stale results
+        /// or change the visual state.
         /// </summary>
         private bool IsRequestCurrent(
             long requestVersion,
@@ -473,12 +473,11 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// This method is provided in case a developer would like their own custom caching strategy for <see cref="ImageExBase"/>.
-        /// By default, it uses the built-in UWP cache provided by <see cref="BitmapImage"/> and
-        /// the <see cref="Image"/> control itself. This method should return an <see cref="ImageSource"/>
-        /// value of the image specified by the provided uri parameter.
-        /// A <see cref="CancellationToken"/> is provided in case the current request is invalidated
-        /// (e.g. the container is recycled before the original image loaded).
+        /// Override this method to provide a custom caching strategy for <see cref="ImageExBase"/>.
+        /// The default implementation uses the built-in UWP cache provided by <see cref="BitmapImage"/>
+        /// and the <see cref="Image"/> control. Return the <see cref="ImageSource"/> for the provided URI.
+        /// The <see cref="CancellationToken"/> signals that the current request is no longer valid.
+        /// For example, the container can be recycled before the original image loads.
         /// </summary>
         /// <example>
         /// <code>
@@ -497,8 +496,7 @@ namespace ImageEx
         ///         propValues.Add(new KeyValuePair&lt;string, object>(nameof(DecodePixelType), DecodePixelType));
         ///     }
         ///
-        ///     // A token is provided here as well to cancel the request to the cache,
-        ///     // if a new image is requested.
+        ///     // The token lets the cache cancel the request when a new image is requested.
         ///     return await ImageCache.Instance.GetFromCacheAsync(imageUri, true, token, propValues);
         /// </code>
         /// </example>
@@ -507,7 +505,7 @@ namespace ImageEx
         /// <returns><see cref="Task"/></returns>
         protected virtual Task<ImageSource> ProvideCachedResourceAsync(Uri imageUri, CancellationToken token)
         {
-            // By default, we just use the built-in UWP image cache provided within the Image control.
+            // Use the built-in UWP image cache provided by the Image control.
             ImageExDiagnostics.RecordBaseBitmapCreated(imageUri, DecodePixelWidth, DecodePixelHeight, DecodePixelType);
             return Task.FromResult((ImageSource)ImageExDeferredBitmapSourceRegistry.CreateDeferredBitmapImage(
                 imageUri,

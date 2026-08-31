@@ -12,11 +12,11 @@ namespace ImageEx
     public static class Extensions
     {
         /// <summary>
-        /// Determines if a rectangle intersects with another rectangle.
+        /// Determines whether one rectangle intersects another rectangle.
         /// </summary>
         /// <param name="rect1">The first rectangle to test.</param>
         /// <param name="rect2">The second rectangle to test.</param>
-        /// <returns>This method returns <see langword="true"/> if there is any intersection, otherwise <see langword="false"/>.</returns>
+        /// <returns><see langword="true"/> when the rectangles intersect. Otherwise, <see langword="false"/>.</returns>
         [Pure]
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static bool IntersectsWith(this Rect rect1, Rect rect2)
@@ -34,7 +34,7 @@ namespace ImageEx
     }
 
     /// <summary>
-    /// Base Code for ImageEx
+    /// Base implementation for ImageEx.
     /// </summary>
     [TemplateVisualState(Name = LoadingState, GroupName = CommonGroup)]
     [TemplateVisualState(Name = LoadedState, GroupName = CommonGroup)]
@@ -53,37 +53,37 @@ namespace ImageEx
         private static readonly TimeSpan OffscreenDetachGracePeriod = TimeSpan.FromMilliseconds(250);
 
         /// <summary>
-        /// Image name in template
+        /// Name of the image element in the template.
         /// </summary>
         protected const string PartImage = "Image";
 
         /// <summary>
-        /// VisualStates name in template
+        /// Name of the visual-states element in the template.
         /// </summary>
         protected const string CommonGroup = "CommonStates";
 
         /// <summary>
-        /// Loading state name in template
+        /// Name of the loading state in the template.
         /// </summary>
         protected const string LoadingState = "Loading";
 
         /// <summary>
-        /// Loaded state name in template
+        /// Name of the loaded state in the template.
         /// </summary>
         protected const string LoadedState = "Loaded";
 
         /// <summary>
-        /// Unloaded state name in template
+        /// Name of the unloaded state in the template.
         /// </summary>
         protected const string UnloadedState = "Unloaded";
 
         /// <summary>
-        /// Failed name in template
+        /// Name of the failed state in the template.
         /// </summary>
         protected const string FailedState = "Failed";
 
         /// <summary>
-        /// Gets the backing image object
+        /// Gets the backing image object.
         /// </summary>
         protected object Image { get; private set; }
 
@@ -114,9 +114,9 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Attach image opened event handler
+        /// Attaches an image-opened event handler.
         /// </summary>
-        /// <param name="handler">Routed Event Handler</param>
+        /// <param name="handler">Routed event handler.</param>
         protected void AttachImageOpened(RoutedEventHandler handler)
         {
             ModifyImageHandler(
@@ -125,9 +125,9 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Remove image opened handler
+        /// Removes an image-opened event handler.
         /// </summary>
-        /// <param name="handler">RoutedEventHandler</param>
+        /// <param name="handler">Routed event handler.</param>
         protected void RemoveImageOpened(RoutedEventHandler handler)
         {
             ModifyImageHandler(
@@ -136,9 +136,9 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Attach image failed event handler
+        /// Attaches an image-failed event handler.
         /// </summary>
-        /// <param name="handler">Exception Routed Event Handler</param>
+        /// <param name="handler">Exception event handler.</param>
         protected void AttachImageFailed(ExceptionRoutedEventHandler handler)
         {
             ModifyImageHandler(
@@ -147,9 +147,9 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Remove Image Failed handler
+        /// Removes an image-failed event handler.
         /// </summary>
-        /// <param name="handler">Exception Routed Event Handler</param>
+        /// <param name="handler">Exception event handler.</param>
         protected void RemoveImageFailed(ExceptionRoutedEventHandler handler)
         {
             ModifyImageHandler(

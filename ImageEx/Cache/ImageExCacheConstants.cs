@@ -33,7 +33,7 @@ internal static class ImageExCacheConstants
     public const long DefaultMaximumSourceBytes = 8L * 1024 * 1024;
 
     /// <summary>
-    /// When cleaning up, reduce cache to this ratio of max size (80%).
+    /// During cleanup, reduce the cache to 80% of its maximum size.
     /// </summary>
     public const double CleanupTargetRatio = 0.8;
 
@@ -48,7 +48,7 @@ internal static class ImageExCacheConstants
     public const string MetadataFileName = "cache_metadata.json";
 
     /// <summary>
-    /// Gets the cache directory path using WinUI-friendly ApplicationData.
+    /// Gets the cache directory path from WinUI ApplicationData.
     /// </summary>
     /// <returns>Full path to the image cache directory.</returns>
     public static string GetCacheDirectory()

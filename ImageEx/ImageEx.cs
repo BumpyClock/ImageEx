@@ -9,9 +9,9 @@ using System.Diagnostics;
 namespace ImageEx
 {
     /// <summary>
-    /// The ImageEx control extends the default Image platform control improving the performance and responsiveness of your Apps.
-    /// Source images are downloaded asynchronously showing a load indicator while in progress.
-    /// Once downloaded, the source image is stored in the App local cache to preserve resources and load time next time the image needs to be displayed.
+    /// The ImageEx control extends the platform Image control to improve app performance and responsiveness.
+    /// It downloads source images asynchronously and shows a loading indicator during each download.
+    /// It stores each downloaded source in the app's local cache so later loads use fewer resources and finish sooner.
     /// </summary>
     public partial class ImageEx : ImageExBase
     {
@@ -33,13 +33,13 @@ namespace ImageEx
         /// <returns>The loaded ImageSource, or null to fall back to base behavior.</returns>
         protected override async Task<ImageSource> ProvideCachedResourceAsync(Uri imageUri, CancellationToken token)
         {
-            // If disk caching disabled, use base (memory-only via BitmapImage built-in cache)
+            // Use the base memory-only cache when disk caching is disabled.
             if (!EnableDiskCache)
             {
                 return await base.ProvideCachedResourceAsync(imageUri, token);
             }
 
-            // Skip disk cache for local/embedded resources - let base handle these
+            // Let the base control handle local and embedded resources.
             if (!imageUri.IsAbsoluteUri ||
                 imageUri.Scheme is "ms-appx" or "ms-resource" or "ms-appdata" or "data" or "file")
             {
@@ -51,12 +51,12 @@ namespace ImageEx
                 return null;
             }
 
-            // Configure cache manager from dependency properties
+            // Configure the cache manager from dependency properties.
             var manager = CacheManagerOverride ?? ImageExCacheManager.Instance;
             manager.MaxCacheDays = DiskCacheDays;
             manager.MaxCacheSizeBytes = DiskCacheSizeMB * 1024L * 1024L;
 
-            // Get DPI scale for adaptive decode sizing (defaults to 1.0 if XamlRoot not available)
+            // Get the DPI scale for adaptive decode sizing. Use 1.0 when XamlRoot is unavailable.
             var dpiScale = XamlRoot?.RasterizationScale ?? 1.0;
 
             var dispatcherQueue = ImageDispatcherQueue;
@@ -75,15 +75,15 @@ namespace ImageEx
                 dpiScale,
                 returnNullOnCancellation: true);
 
-            // If this request was superseded (newer Source, null Source, or unload), suppress both
-            // the cache-hit shimmer-skip transition and any fallback attach. Returning null here
-            // lets LoadImageAsync's IsRequestCurrent guard drop the stale result entirely.
+            // If a newer source, a null source, or unload superseded this request, suppress the
+            // cache-hit shimmer transition and fallback attach. Returning null lets
+            // LoadImageAsync's IsRequestCurrent guard drop the stale result.
             if (token.IsCancellationRequested)
             {
                 return null;
             }
 
-            // Skip shimmer animation on cache hit by jumping directly to Loaded state
+            // Skip the shimmer animation on a cache hit by going directly to the Loaded state.
             if (result.WasCacheHit && result.Image != null)
             {
                 VisualStateManager.GoToState(this, LoadedState, useTransitions: false);
