@@ -169,8 +169,12 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
     /// </summary>
     public void AddOrUpdateEntry(string cacheKey, CacheEntry entry)
     {
-        _metadata[cacheKey] = entry with { LastAccessUtc = DateTimeOffset.UtcNow };
-        MarkMetadataDirty();
+        lock (_writerGate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _metadata[cacheKey] = entry with { LastAccessUtc = DateTimeOffset.UtcNow };
+            MarkMetadataDirtyLocked();
+        }
     }
 
     /// <summary>
@@ -184,20 +188,23 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
         DateTimeOffset accessUtc,
         Action? beforeUpdateAttempt)
     {
-        while (_metadata.TryGetValue(cacheKey, out var entry))
+        beforeUpdateAttempt?.Invoke();
+        lock (_writerGate)
         {
-            if (accessUtc <= entry.LastAccessUtc)
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            while (_metadata.TryGetValue(cacheKey, out var entry))
             {
-                return;
-            }
+                if (accessUtc <= entry.LastAccessUtc)
+                {
+                    return;
+                }
 
-            var updatedEntry = entry with { LastAccessUtc = accessUtc };
-            beforeUpdateAttempt?.Invoke();
-            beforeUpdateAttempt = null;
-            if (_metadata.TryUpdate(cacheKey, updatedEntry, entry))
-            {
-                MarkMetadataDirty();
-                return;
+                var updatedEntry = entry with { LastAccessUtc = accessUtc };
+                if (_metadata.TryUpdate(cacheKey, updatedEntry, entry))
+                {
+                    MarkMetadataDirtyLocked();
+                    return;
+                }
             }
         }
     }
@@ -207,9 +214,13 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
     /// </summary>
     public void RemoveEntry(string cacheKey)
     {
-        if (_metadata.TryRemove(cacheKey, out _))
+        lock (_writerGate)
         {
-            MarkMetadataDirty();
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_metadata.TryRemove(cacheKey, out _))
+            {
+                MarkMetadataDirtyLocked();
+            }
         }
     }
 
@@ -262,23 +273,19 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
         }
     }
 
-    private void MarkMetadataDirty()
+    private void MarkMetadataDirtyLocked()
     {
-        lock (_writerGate)
+        var now = DateTimeOffset.UtcNow;
+        if (_persistedMetadataVersion >= _metadataVersion)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            var now = DateTimeOffset.UtcNow;
-            if (_persistedMetadataVersion >= _metadataVersion)
-            {
-                _firstDirtyUtc = now;
-            }
-
-            _lastDirtyUtc = now;
-            _metadataVersion++;
-            _lastWriterFailure = null;
-            EnsureWriterStartedLocked();
-            SignalWriterLocked();
+            _firstDirtyUtc = now;
         }
+
+        _lastDirtyUtc = now;
+        _metadataVersion++;
+        _lastWriterFailure = null;
+        EnsureWriterStartedLocked();
+        SignalWriterLocked();
     }
 
     private void EnsureWriterStartedLocked()
