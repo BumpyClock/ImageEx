@@ -28,6 +28,7 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
     private readonly TimeSpan _metadataDebounce;
     private readonly TimeSpan _metadataMaximumDelay;
     private Task _writerTask = Task.CompletedTask;
+    private Task? _disposeTask;
     private long _metadataVersion;
     private long _persistedMetadataVersion;
     private DateTimeOffset _firstDirtyUtc;
@@ -400,25 +401,31 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         lock (_writerGate)
         {
-            if (_disposed)
+            if (_disposeTask is null)
             {
-                return;
+                _disposed = true;
+                _disposeTask = DisposeCoreAsync();
             }
+
+            return new ValueTask(_disposeTask);
         }
+    }
 
-        await FlushMetadataAsync().ConfigureAwait(false);
-
-        lock (_writerGate)
+    private async Task DisposeCoreAsync()
+    {
+        try
         {
-            _disposed = true;
+            await FlushMetadataAsync().ConfigureAwait(false);
         }
-
-        _metadataSignal.Dispose();
-        _metadataLock.Dispose();
+        finally
+        {
+            _metadataSignal.Dispose();
+            _metadataLock.Dispose();
+        }
     }
 
     /// <summary>
