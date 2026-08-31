@@ -4,6 +4,7 @@
 #nullable enable
 
 using System.Collections.Concurrent;
+using System.Buffers;
 using System.Diagnostics;
 using System.Net.Http;
 using System.Runtime.InteropServices.WindowsRuntime;
@@ -41,6 +42,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private readonly SemaphoreSlim _downloadConcurrency;
     private readonly SemaphoreSlim _decodeConcurrency;
     private readonly object _lifetimeGate = new();
+    private readonly long _maximumSourceBytes;
     private DateTimeOffset _lastCleanup = DateTimeOffset.MinValue;
     private bool _initialSizeScanned;
     private bool _disposed;
@@ -112,7 +114,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         string cacheDirectory,
         HttpMessageHandler? httpMessageHandler = null,
         int maxConcurrentDownloads = 2,
-        int maxConcurrentDecodes = 2)
+        int maxConcurrentDecodes = 2,
+        long maximumSourceBytes = ImageExCacheConstants.DefaultMaximumSourceBytes)
     {
         _diskCache = new ImageExDiskCache(cacheDirectory);
         _httpClient = httpMessageHandler == null
@@ -122,6 +125,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         maxConcurrentDecodes = Math.Max(1, maxConcurrentDecodes);
         _downloadConcurrency = new SemaphoreSlim(maxConcurrentDownloads, maxConcurrentDownloads);
         _decodeConcurrency = new SemaphoreSlim(maxConcurrentDecodes, maxConcurrentDecodes);
+        _maximumSourceBytes = Math.Clamp(maximumSourceBytes, 1, int.MaxValue);
     }
 
     /// <summary>
@@ -141,7 +145,15 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         int DiskCacheEntryCount,
         long DiskCacheBytes);
 
-    private readonly record struct DownloadResult(byte[]? Bytes, string? ContentType);
+    internal sealed record DownloadedBytes(byte[] Buffer, int Length)
+    {
+        public ReadOnlyMemory<byte> Memory => Buffer.AsMemory(0, Length);
+    }
+
+    private readonly record struct DownloadResult(DownloadedBytes? Bytes, string? ContentType);
+
+    private sealed class ImageSourceTooLargeException(long observedBytes, long maximumBytes)
+        : Exception($"Image source response exceeded {maximumBytes} bytes after {observedBytes} bytes.");
 
     private readonly record struct DecodeDimensions(
         int TargetWidth,
@@ -406,7 +418,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 return CancelledResult(token, returnNullOnCancellation);
             }
 
-            await SaveDownloadedFileAsync(cacheKey, uri, newFilePath, extension, result.Bytes, token, returnNullOnCancellation).ConfigureAwait(false);
+            await SaveDownloadedFileAsync(cacheKey, uri, newFilePath, extension, result.Bytes.Memory, token, returnNullOnCancellation).ConfigureAwait(false);
             await EnforceCleanupIfNeededAsync().ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!returnNullOnCancellation)
@@ -748,12 +760,21 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             {
                 try
                 {
-                    using var response = await _httpClient.GetAsync(uri, token).ConfigureAwait(false);
+                    using var response = await _httpClient.GetAsync(
+                        uri,
+                        HttpCompletionOption.ResponseHeadersRead,
+                        token).ConfigureAwait(false);
                     response.EnsureSuccessStatusCode();
                     var contentType = response.Content.Headers.ContentType?.MediaType;
-                    var bytes = await response.Content.ReadAsByteArrayAsync(token).ConfigureAwait(false);
+                    var bytes = await ReadBoundedContentAsync(response.Content, token).ConfigureAwait(false);
                     RecordDownloadCompleted(uri, bytes.Length);
                     return new DownloadResult(bytes, contentType);
+                }
+                catch (ImageSourceTooLargeException ex)
+                {
+                    Debug.WriteLine($"[ImageExCache] Rejected oversized image source {uri.Host}: {ex.Message}");
+                    RecordDownloadFailed(uri);
+                    return new DownloadResult(null, null);
                 }
                 catch (HttpRequestException ex) when (IsTransientError(ex) && attempt < maxAttempts - 1)
                 {
@@ -780,6 +801,66 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         finally
         {
             _downloadConcurrency.Release();
+        }
+    }
+
+    internal async Task<DownloadedBytes> ReadBoundedContentAsync(
+        HttpContent content,
+        CancellationToken token)
+    {
+        var declaredLength = content.Headers.ContentLength;
+        if (declaredLength > _maximumSourceBytes)
+        {
+            throw new ImageSourceTooLargeException(declaredLength.Value, _maximumSourceBytes);
+        }
+
+        var initialCapacity = declaredLength is > 0
+            ? checked((int)declaredLength.Value)
+            : (int)Math.Min(64 * 1024, _maximumSourceBytes);
+        using var source = await content.ReadAsStreamAsync(token).ConfigureAwait(false);
+        using var destination = new MemoryStream(initialCapacity);
+        var copyBuffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        try
+        {
+            while (true)
+            {
+                var remaining = _maximumSourceBytes - destination.Length;
+                var requestedBytes = (int)Math.Min(copyBuffer.Length, remaining + 1);
+                var read = await source
+                    .ReadAsync(copyBuffer.AsMemory(0, requestedBytes), token)
+                    .ConfigureAwait(false);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                if (read > remaining)
+                {
+                    throw new ImageSourceTooLargeException(destination.Length + read, _maximumSourceBytes);
+                }
+
+                var requiredCapacity = checked((int)(destination.Length + read));
+                if (destination.Capacity < requiredCapacity)
+                {
+                    var doubledCapacity = Math.Max(1L, destination.Capacity) * 2;
+                    destination.Capacity = checked((int)Math.Min(
+                        _maximumSourceBytes,
+                        Math.Max(requiredCapacity, doubledCapacity)));
+                }
+
+                destination.Write(copyBuffer, 0, read);
+            }
+
+            if (!destination.TryGetBuffer(out var segment) || segment.Array is null)
+            {
+                throw new InvalidOperationException("Image source buffer was not accessible.");
+            }
+
+            return new DownloadedBytes(segment.Array, checked((int)destination.Length));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(copyBuffer);
         }
     }
 
@@ -872,7 +953,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         Uri uri,
         string filePath,
         string extension,
-        byte[] bytes,
+        ReadOnlyMemory<byte> bytes,
         CancellationToken token,
         bool returnNullOnCancellation)
     {
@@ -898,10 +979,18 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             }
 
             Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
-            await File.WriteAllBytesAsync(
+            await using (var fileStream = new FileStream(
                 filePath,
-                bytes,
-                returnNullOnCancellation ? CancellationToken.None : token).ConfigureAwait(false);
+                FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: 64 * 1024,
+                useAsync: true))
+            {
+                await fileStream.WriteAsync(
+                    bytes,
+                    returnNullOnCancellation ? CancellationToken.None : token).ConfigureAwait(false);
+            }
 
             _diskCache.AddOrUpdateEntry(cacheKey, new CacheEntry
             {
@@ -1065,7 +1154,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     }
 
     private async Task<ImageSource?> LoadFromBytesAsync(
-        byte[] bytes,
+        DownloadedBytes bytes,
         bool isSvg,
         int decodeWidth,
         int decodeHeight,
@@ -1098,7 +1187,12 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         try
         {
             RecordDecodeStarted("bytes", bytes.Length, decodeWidth, decodeHeight, decodeType, isSvg);
-            using var memoryStream = new MemoryStream(bytes);
+            using var memoryStream = new MemoryStream(
+                bytes.Buffer,
+                0,
+                bytes.Length,
+                writable: false,
+                publiclyVisible: true);
             var image = await LoadFromStreamAsync(memoryStream, isSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
             RecordDecodeCompleted("bytes", image != null);
             return image;

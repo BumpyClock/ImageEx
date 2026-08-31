@@ -3,6 +3,8 @@ The ImageEx control extends the standard image platform control, improving the p
 The source images are loaded asynchronously, and a loading indicator is displayed during execution.
 After downloading, the original image is saved in the local cache of the application to save resources and loading time the next time the image is displayed.
 
+ImageEx accepts at most 8 MiB of source bytes for each raster or SVG response. It rejects larger declared responses before reading and stops chunked responses at the limit.
+
 This package contains a separate ImageEx control from the Windows Community Toolkit 7.x package.
 Since this control was removed in Toolkit version 8.0, this package was created containing only this control and having no dependencies.
 Originally developed by Microsoft.Toolkit

@@ -28,6 +28,11 @@ internal static class ImageExCacheConstants
     public const long DefaultCacheSizeBytes = DefaultCacheSizeMB * 1024L * 1024L;
 
     /// <summary>
+    /// Maximum source response bytes accepted for one raster or SVG download.
+    /// </summary>
+    public const long DefaultMaximumSourceBytes = 8L * 1024 * 1024;
+
+    /// <summary>
     /// When cleaning up, reduce cache to this ratio of max size (80%).
     /// </summary>
     public const double CleanupTargetRatio = 0.8;
