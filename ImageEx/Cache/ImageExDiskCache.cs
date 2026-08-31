@@ -13,18 +13,42 @@ namespace ImageEx.Cache;
 /// <summary>
 /// Manages disk-level cache operations including file I/O, key computation, and metadata.
 /// </summary>
-internal sealed class ImageExDiskCache
+internal sealed class ImageExDiskCache : IAsyncDisposable
 {
+    private static readonly TimeSpan DefaultMetadataDebounce = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan DefaultMetadataMaximumDelay = TimeSpan.FromSeconds(5);
+
     private readonly string _cacheDir;
     private readonly string _metadataPath;
     private readonly ConcurrentDictionary<string, CacheEntry> _metadata = new();
     private readonly SemaphoreSlim _metadataLock = new(1, 1);
+    private readonly SemaphoreSlim _metadataSignal = new(0, 1);
+    private readonly object _writerGate = new();
+    private readonly Func<IReadOnlyDictionary<string, CacheEntry>, CancellationToken, Task> _metadataWriter;
+    private readonly TimeSpan _metadataDebounce;
+    private readonly TimeSpan _metadataMaximumDelay;
+    private Task _writerTask = Task.CompletedTask;
+    private long _metadataVersion;
+    private long _persistedMetadataVersion;
+    private DateTimeOffset _firstDirtyUtc;
+    private DateTimeOffset _lastDirtyUtc;
+    private Exception? _lastWriterFailure;
+    private bool _writerRunning;
+    private bool _forceFlush;
     private bool _loaded;
+    private bool _disposed;
 
-    public ImageExDiskCache(string cacheDirectory)
+    public ImageExDiskCache(
+        string cacheDirectory,
+        Func<IReadOnlyDictionary<string, CacheEntry>, CancellationToken, Task>? metadataWriter = null,
+        TimeSpan? metadataDebounce = null,
+        TimeSpan? metadataMaximumDelay = null)
     {
         _cacheDir = cacheDirectory;
         _metadataPath = Path.Combine(_cacheDir, ImageExCacheConstants.MetadataFileName);
+        _metadataWriter = metadataWriter ?? WriteMetadataFileAsync;
+        _metadataDebounce = metadataDebounce ?? DefaultMetadataDebounce;
+        _metadataMaximumDelay = metadataMaximumDelay ?? DefaultMetadataMaximumDelay;
     }
 
     /// <summary>
@@ -144,24 +168,49 @@ internal sealed class ImageExDiskCache
     /// </summary>
     public void AddOrUpdateEntry(string cacheKey, CacheEntry entry)
     {
-        entry.LastAccessUtc = DateTimeOffset.UtcNow;
-        _metadata[cacheKey] = entry;
+        _metadata[cacheKey] = entry with { LastAccessUtc = DateTimeOffset.UtcNow };
+        MarkMetadataDirty();
     }
 
     /// <summary>
     /// Updates the last access time for LRU tracking.
     /// </summary>
     public void UpdateAccessTime(string cacheKey)
+        => UpdateAccessTime(cacheKey, DateTimeOffset.UtcNow, beforeUpdateAttempt: null);
+
+    internal void UpdateAccessTime(
+        string cacheKey,
+        DateTimeOffset accessUtc,
+        Action? beforeUpdateAttempt)
     {
-        if (_metadata.TryGetValue(cacheKey, out var entry))
-            entry.LastAccessUtc = DateTimeOffset.UtcNow;
+        while (_metadata.TryGetValue(cacheKey, out var entry))
+        {
+            if (accessUtc <= entry.LastAccessUtc)
+            {
+                return;
+            }
+
+            var updatedEntry = entry with { LastAccessUtc = accessUtc };
+            beforeUpdateAttempt?.Invoke();
+            beforeUpdateAttempt = null;
+            if (_metadata.TryUpdate(cacheKey, updatedEntry, entry))
+            {
+                MarkMetadataDirty();
+                return;
+            }
+        }
     }
 
     /// <summary>
     /// Removes a cache entry.
     /// </summary>
     public void RemoveEntry(string cacheKey)
-        => _metadata.TryRemove(cacheKey, out _);
+    {
+        if (_metadata.TryRemove(cacheKey, out _))
+        {
+            MarkMetadataDirty();
+        }
+    }
 
     /// <summary>
     /// Gets all cache entries for enumeration.
@@ -176,22 +225,200 @@ internal sealed class ImageExDiskCache
         => _metadata.Values.Sum(e => e.SizeBytes);
 
     /// <summary>
-    /// Persists metadata to disk.
+    /// Persists every dirty metadata version to disk before this method returns.
     /// </summary>
-    public async Task SaveMetadataAsync()
+    public async Task FlushMetadataAsync(CancellationToken cancellationToken = default)
     {
-        await _metadataLock.WaitAsync().ConfigureAwait(false);
+        Task writerTask;
+        lock (_writerGate)
+        {
+            if (_persistedMetadataVersion >= _metadataVersion)
+            {
+                return;
+            }
+
+            _forceFlush = true;
+            EnsureWriterStartedLocked();
+            SignalWriterLocked();
+            writerTask = _writerTask;
+        }
+
+        await writerTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+        lock (_writerGate)
+        {
+            if (_persistedMetadataVersion >= _metadataVersion)
+            {
+                return;
+            }
+
+            if (_lastWriterFailure is not null)
+            {
+                throw new IOException("ImageEx cache metadata flush failed.", _lastWriterFailure);
+            }
+
+            throw new IOException("ImageEx cache metadata flush ended before all versions were persisted.");
+        }
+    }
+
+    private void MarkMetadataDirty()
+    {
+        lock (_writerGate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var now = DateTimeOffset.UtcNow;
+            if (_persistedMetadataVersion >= _metadataVersion)
+            {
+                _firstDirtyUtc = now;
+            }
+
+            _lastDirtyUtc = now;
+            _metadataVersion++;
+            _lastWriterFailure = null;
+            EnsureWriterStartedLocked();
+            SignalWriterLocked();
+        }
+    }
+
+    private void EnsureWriterStartedLocked()
+    {
+        if (_writerRunning)
+        {
+            return;
+        }
+
+        _writerRunning = true;
+        _writerTask = Task.Run(RunMetadataWriterAsync);
+    }
+
+    private void SignalWriterLocked()
+    {
+        if (_metadataSignal.CurrentCount == 0)
+        {
+            _metadataSignal.Release();
+        }
+    }
+
+    private async Task RunMetadataWriterAsync()
+    {
+        while (true)
+        {
+            TimeSpan delay;
+            long version;
+            Dictionary<string, CacheEntry> snapshot;
+            lock (_writerGate)
+            {
+                if (_persistedMetadataVersion >= _metadataVersion)
+                {
+                    _forceFlush = false;
+                    _writerRunning = false;
+                    return;
+                }
+
+                var now = DateTimeOffset.UtcNow;
+                var dueUtc = _forceFlush
+                    ? now
+                    : Min(
+                        _lastDirtyUtc + _metadataDebounce,
+                        _firstDirtyUtc + _metadataMaximumDelay);
+                delay = dueUtc > now ? dueUtc - now : TimeSpan.Zero;
+                version = _metadataVersion;
+                snapshot = _metadata.ToDictionary(entry => entry.Key, entry => entry.Value);
+            }
+
+            if (delay > TimeSpan.Zero && await _metadataSignal.WaitAsync(delay).ConfigureAwait(false))
+            {
+                continue;
+            }
+
+            while (_metadataSignal.Wait(0))
+            {
+            }
+
+            try
+            {
+                await _metadataWriter(snapshot, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                lock (_writerGate)
+                {
+                    _lastWriterFailure = ex;
+                    _forceFlush = false;
+                    _writerRunning = false;
+                }
+
+                return;
+            }
+
+            lock (_writerGate)
+            {
+                _persistedMetadataVersion = Math.Max(_persistedMetadataVersion, version);
+                _lastWriterFailure = null;
+            }
+        }
+    }
+
+    private static DateTimeOffset Min(DateTimeOffset left, DateTimeOffset right)
+        => left <= right ? left : right;
+
+    private async Task WriteMetadataFileAsync(
+        IReadOnlyDictionary<string, CacheEntry> snapshot,
+        CancellationToken cancellationToken)
+    {
+        await _metadataLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var temporaryPath = Path.Combine(
+            _cacheDir,
+            $".{ImageExCacheConstants.MetadataFileName}.{Guid.NewGuid():N}.tmp");
         try
         {
             Directory.CreateDirectory(_cacheDir);
-            var snapshot = _metadata.ToDictionary(k => k.Key, v => v.Value);
-            var json = JsonSerializer.Serialize(snapshot, ImageExCacheJsonContext.Default.DictionaryStringCacheEntry);
-            await File.WriteAllTextAsync(_metadataPath, json).ConfigureAwait(false);
+            var serializableSnapshot = snapshot as Dictionary<string, CacheEntry>
+                ?? snapshot.ToDictionary(entry => entry.Key, entry => entry.Value);
+            var json = JsonSerializer.Serialize(
+                serializableSnapshot,
+                ImageExCacheJsonContext.Default.DictionaryStringCacheEntry);
+            await File.WriteAllTextAsync(temporaryPath, json, cancellationToken).ConfigureAwait(false);
+
+            if (File.Exists(_metadataPath))
+            {
+                File.Replace(temporaryPath, _metadataPath, destinationBackupFileName: null);
+            }
+            else
+            {
+                File.Move(temporaryPath, _metadataPath);
+            }
         }
         finally
         {
+            if (File.Exists(temporaryPath))
+            {
+                File.Delete(temporaryPath);
+            }
+
             _metadataLock.Release();
         }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        lock (_writerGate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+        }
+
+        await FlushMetadataAsync().ConfigureAwait(false);
+
+        lock (_writerGate)
+        {
+            _disposed = true;
+        }
+
+        _metadataSignal.Dispose();
+        _metadataLock.Dispose();
     }
 
     /// <summary>
@@ -220,30 +447,30 @@ internal sealed class ImageExDiskCache
 /// <summary>
 /// Represents a cached image entry with metadata for TTL and LRU tracking.
 /// </summary>
-internal sealed class CacheEntry
+internal sealed record CacheEntry
 {
     /// <summary>
     /// Original URL of the cached image.
     /// </summary>
-    public string Url { get; set; } = string.Empty;
+    public string Url { get; init; } = string.Empty;
 
     /// <summary>
     /// File extension (including dot) for the cached file.
     /// </summary>
-    public string Extension { get; set; } = string.Empty;
+    public string Extension { get; init; } = string.Empty;
 
     /// <summary>
     /// When the image was originally downloaded (for TTL).
     /// </summary>
-    public DateTimeOffset DownloadedUtc { get; set; }
+    public DateTimeOffset DownloadedUtc { get; init; }
 
     /// <summary>
     /// When the image was last accessed (for LRU).
     /// </summary>
-    public DateTimeOffset LastAccessUtc { get; set; }
+    public DateTimeOffset LastAccessUtc { get; init; }
 
     /// <summary>
     /// Size of the cached file in bytes.
     /// </summary>
-    public long SizeBytes { get; set; }
+    public long SizeBytes { get; init; }
 }

@@ -22,7 +22,7 @@ namespace ImageEx.Cache;
 /// This is a static singleton and is typically kept for app lifetime.
 /// It still implements <see cref="IDisposable"/> so tests or explicit host shutdown can flush/tear down resources deterministically.
 /// </remarks>
-internal sealed partial class ImageExCacheManager : IDisposable
+internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposable
 {
     /// <summary>
     /// Singleton instance.
@@ -40,9 +40,13 @@ internal sealed partial class ImageExCacheManager : IDisposable
     private readonly SemaphoreSlim _cleanupLock = new(1, 1);
     private readonly SemaphoreSlim _downloadConcurrency;
     private readonly SemaphoreSlim _decodeConcurrency;
+    private readonly object _lifetimeGate = new();
     private DateTimeOffset _lastCleanup = DateTimeOffset.MinValue;
     private bool _initialSizeScanned;
     private bool _disposed;
+    private int _activeOperations;
+    private TaskCompletionSource? _operationsDrained;
+    private Task? _disposeTask;
     private const int TelemetrySampleInterval = 50;
     private const int MaxSmallDecodedImageCacheEntries = 128;
     private const long MaxSmallDecodedImageCacheBytes = 32L * 1024 * 1024;
@@ -270,10 +274,13 @@ internal sealed partial class ImageExCacheManager : IDisposable
         double dpiScale = 1.0,
         bool returnNullOnCancellation = false)
     {
-        if (token.IsCancellationRequested)
+        BeginOperation();
+        try
         {
-            return CancelledResult(token, returnNullOnCancellation);
-        }
+            if (token.IsCancellationRequested)
+            {
+                return CancelledResult(token, returnNullOnCancellation);
+            }
 
         // Skip non-http URIs - return null to let base pipeline handle
         if (!uri.IsHttpUri())
@@ -327,12 +334,6 @@ internal sealed partial class ImageExCacheManager : IDisposable
                             image,
                             dispatcherQueue).ConfigureAwait(false);
                         _diskCache.UpdateAccessTime(cacheKey);
-                        // Fire-and-forget to persist LRU update
-                        _ = Task.Run(async () =>
-                        {
-                            try { await _diskCache.SaveMetadataAsync().ConfigureAwait(false); }
-                            catch { /* Best effort */ }
-                        });
 
                         RecordCacheHit(uri, entry.SizeBytes, decodeWidth, decodeHeight, decodeType);
                         ForgetDownloadFailure(cacheKey);
@@ -406,17 +407,7 @@ internal sealed partial class ImageExCacheManager : IDisposable
             }
 
             await SaveDownloadedFileAsync(cacheKey, uri, newFilePath, extension, result.Bytes, token, returnNullOnCancellation).ConfigureAwait(false);
-
-            // Fire-and-forget: persist metadata + cleanup check
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await _diskCache.SaveMetadataAsync().ConfigureAwait(false);
-                    await EnforceCleanupIfNeededAsync().ConfigureAwait(false);
-                }
-                catch { /* Best effort */ }
-            });
+            await EnforceCleanupIfNeededAsync().ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!returnNullOnCancellation)
         {
@@ -446,7 +437,36 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 dispatcherQueue).ConfigureAwait(false);
         }
 
-        return new CacheResult(loadedImage, WasCacheHit: false);
+            return new CacheResult(loadedImage, WasCacheHit: false);
+        }
+        finally
+        {
+            EndOperation();
+        }
+    }
+
+    private void BeginOperation()
+    {
+        lock (_lifetimeGate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _activeOperations++;
+        }
+    }
+
+    private void EndOperation()
+    {
+        TaskCompletionSource? operationsDrained = null;
+        lock (_lifetimeGate)
+        {
+            _activeOperations--;
+            if (_disposed && _activeOperations == 0)
+            {
+                operationsDrained = _operationsDrained;
+            }
+        }
+
+        operationsDrained?.TrySetResult();
     }
 
     private bool TryGetSmallDecodedImage(
@@ -1919,9 +1939,9 @@ internal sealed partial class ImageExCacheManager : IDisposable
                 }
             }
 
+            await _diskCache.FlushMetadataAsync().ConfigureAwait(false);
             if (removed > 0)
             {
-                await _diskCache.SaveMetadataAsync().ConfigureAwait(false);
                 Debug.WriteLine($"[ImageExCache] Cleanup: {removed} files, {freedBytes / 1024 / 1024}MB freed");
             }
         }
@@ -1932,14 +1952,48 @@ internal sealed partial class ImageExCacheManager : IDisposable
     }
 
     public void Dispose()
+        => DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+    public ValueTask DisposeAsync()
     {
-        if (_disposed)
+        lock (_lifetimeGate)
         {
-            return;
+            if (_disposeTask is null)
+            {
+                _disposed = true;
+                var operationsDrained = _activeOperations == 0
+                    ? Task.CompletedTask
+                    : (_operationsDrained = new TaskCompletionSource(
+                        TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+                _httpClient.Dispose();
+                _disposeTask = DisposeCoreAsync(operationsDrained);
+            }
+
+            return new ValueTask(_disposeTask);
+        }
+    }
+
+    private async Task DisposeCoreAsync(Task operationsDrained)
+    {
+        await operationsDrained.ConfigureAwait(false);
+        var activeDownloads = _inFlightDownloads.Values
+            .Where(download => download.IsValueCreated)
+            .Select(download => download.Value.Task)
+            .ToArray();
+        if (activeDownloads.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(activeDownloads).ConfigureAwait(false);
+            }
+            catch
+            {
+                // HttpClient disposal cancels active downloads before metadata flush.
+            }
         }
 
-        _disposed = true;
-        _httpClient.Dispose();
+        await _diskCache.FlushMetadataAsync().ConfigureAwait(false);
+        await _diskCache.DisposeAsync().ConfigureAwait(false);
         _cleanupLock.Dispose();
         _downloadConcurrency.Dispose();
         _decodeConcurrency.Dispose();
