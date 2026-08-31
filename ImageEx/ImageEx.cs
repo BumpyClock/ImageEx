@@ -15,6 +15,8 @@ namespace ImageEx
     /// </summary>
     public partial class ImageEx : ImageExBase
     {
+        internal ImageExCacheManager CacheManagerOverride { get; set; }
+
         /// <summary>
         /// Initializes a new instance of the <see cref="ImageEx"/> class.
         /// </summary>
@@ -50,7 +52,7 @@ namespace ImageEx
             }
 
             // Configure cache manager from dependency properties
-            var manager = ImageExCacheManager.Instance;
+            var manager = CacheManagerOverride ?? ImageExCacheManager.Instance;
             manager.MaxCacheDays = DiskCacheDays;
             manager.MaxCacheSizeBytes = DiskCacheSizeMB * 1024L * 1024L;
 

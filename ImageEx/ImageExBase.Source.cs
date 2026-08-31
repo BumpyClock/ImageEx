@@ -35,6 +35,8 @@ namespace ImageEx
         private void OnImageExUnloaded(object sender, RoutedEventArgs e)
         {
             _isInViewport = false;
+            Interlocked.Increment(ref _viewportStateGeneration);
+            CancelPendingOffscreenDetach();
             CleanupTokenSource();
 
             if (_currentImageSource != null)
@@ -134,6 +136,8 @@ namespace ImageEx
 
             if (e.OldValue == null || e.NewValue == null || !e.OldValue.Equals(e.NewValue))
             {
+                Interlocked.Increment(ref control._viewportStateGeneration);
+                control.CancelPendingOffscreenDetach();
                 if (e.NewValue == null)
                 {
                     control._lazyLoadingSource = null;

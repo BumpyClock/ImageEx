@@ -22,6 +22,7 @@ namespace ImageEx
         long OffscreenAttachedObservations,
         long OffscreenDetachCount,
         long LazyDeferredCount,
+        long CacheReattachCount,
         long HttpFallbackCount,
         long HttpFallbackDecodedBytes,
         long BaseBitmapCreatedCount,
@@ -43,6 +44,7 @@ namespace ImageEx
         private static long s_offscreenAttachedObservations;
         private static long s_offscreenDetachCount;
         private static long s_lazyDeferredCount;
+        private static long s_cacheReattachCount;
         private static long s_httpFallbackCount;
         private static long s_httpFallbackDecodedBytes;
         private static long s_baseBitmapCreatedCount;
@@ -63,6 +65,7 @@ namespace ImageEx
                 Interlocked.Read(ref s_offscreenAttachedObservations),
                 Interlocked.Read(ref s_offscreenDetachCount),
                 Interlocked.Read(ref s_lazyDeferredCount),
+                Interlocked.Read(ref s_cacheReattachCount),
                 Interlocked.Read(ref s_httpFallbackCount),
                 Interlocked.Read(ref s_httpFallbackDecodedBytes),
                 Interlocked.Read(ref s_baseBitmapCreatedCount),
@@ -162,6 +165,15 @@ namespace ImageEx
             }
         }
 
+        internal static void RecordCacheReattach(ImageExBase control)
+        {
+            var count = Interlocked.Increment(ref s_cacheReattachCount);
+            if (count == 1 || ShouldSample(count))
+            {
+                LogSnapshot($"cache-reattach:{control.GetType().Name}");
+            }
+        }
+
         internal static void RecordHttpFallback(Uri uri, int decodeWidth, int decodeHeight, DecodePixelType decodeType)
         {
             var count = Interlocked.Increment(ref s_httpFallbackCount);
@@ -221,6 +233,7 @@ namespace ImageEx
                 $"OffscreenAttachedObservations={snapshot.OffscreenAttachedObservations} " +
                 $"OffscreenDetachCount={snapshot.OffscreenDetachCount} " +
                 $"LazyDeferredCount={snapshot.LazyDeferredCount} " +
+                $"CacheReattachCount={snapshot.CacheReattachCount} " +
                 $"HttpFallbackCount={snapshot.HttpFallbackCount} " +
                 $"HttpFallbackDecodedMB={ToMegabytes(snapshot.HttpFallbackDecodedBytes):F1} " +
                 $"BaseBitmapCreatedCount={snapshot.BaseBitmapCreatedCount} " +

@@ -48,6 +48,9 @@ namespace ImageEx
         private ImageSource _currentImageSource;
         private readonly DispatcherQueue _creationDispatcherQueue;
         private long _diagnosticAttachedSourceBytes;
+        private CancellationTokenSource _offscreenDetachTokenSource;
+        private long _viewportStateGeneration;
+        private static readonly TimeSpan OffscreenDetachGracePeriod = TimeSpan.FromMilliseconds(250);
 
         /// <summary>
         /// Image name in template
@@ -328,15 +331,25 @@ namespace ImageEx
 
         private void ApplyLazyLoadingViewportState(bool isInViewport)
         {
+            var generation = Interlocked.Increment(ref _viewportStateGeneration);
             if (isInViewport)
             {
                 _isInViewport = true;
+                CancelPendingOffscreenDetach();
 
                 if (_lazyLoadingSource != null)
                 {
                     var source = _lazyLoadingSource;
                     _lazyLoadingSource = null;
                     SetSource(source);
+                }
+                else if (DetachSourceWhenOutsideViewport
+                    && Source != null
+                    && !HasAttachedSource()
+                    && !HasCurrentRequest())
+                {
+                    ImageExDiagnostics.RecordCacheReattach(this);
+                    RestartSourceIfNeeded();
                 }
             }
             else
@@ -348,6 +361,115 @@ namespace ImageEx
                 }
 
                 SuspendSourceUntilViewport();
+                if (DetachSourceWhenOutsideViewport && HasAttachedSource())
+                {
+                    ScheduleOffscreenDetach(generation);
+                }
+            }
+        }
+
+        internal void ApplyLazyLoadingViewportStateForTesting(bool isInViewport)
+            => ApplyLazyLoadingViewportState(isInViewport);
+
+        private void ScheduleOffscreenDetach(long generation)
+        {
+            CancelPendingOffscreenDetach();
+            var tokenSource = new CancellationTokenSource();
+            _offscreenDetachTokenSource = tokenSource;
+            _ = DetachSourceAfterGracePeriodAsync(generation, tokenSource);
+        }
+
+        private async Task DetachSourceAfterGracePeriodAsync(
+            long generation,
+            CancellationTokenSource tokenSource)
+        {
+            var completeOnExit = true;
+            try
+            {
+                await Task.Delay(OffscreenDetachGracePeriod, tokenSource.Token);
+                if (tokenSource.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                var dispatcherQueue = ImageDispatcherQueue;
+                if (dispatcherQueue is { HasThreadAccess: false })
+                {
+                    if (dispatcherQueue.TryEnqueue(() =>
+                    {
+                        try
+                        {
+                            ApplyOffscreenDetach(generation, tokenSource);
+                        }
+                        finally
+                        {
+                            CompletePendingOffscreenDetach(tokenSource);
+                        }
+                    }))
+                    {
+                        completeOnExit = false;
+                    }
+
+                    return;
+                }
+
+                ApplyOffscreenDetach(generation, tokenSource);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            finally
+            {
+                if (completeOnExit)
+                {
+                    CompletePendingOffscreenDetach(tokenSource);
+                }
+            }
+        }
+
+        private void CompletePendingOffscreenDetach(CancellationTokenSource tokenSource)
+        {
+            if (ReferenceEquals(_offscreenDetachTokenSource, tokenSource))
+            {
+                _offscreenDetachTokenSource = null;
+            }
+
+            tokenSource.Dispose();
+        }
+
+        private void ApplyOffscreenDetach(long generation, CancellationTokenSource tokenSource)
+        {
+            if (!ReferenceEquals(_offscreenDetachTokenSource, tokenSource)
+                || tokenSource.IsCancellationRequested
+                || Interlocked.Read(ref _viewportStateGeneration) != generation
+                || _isInViewport
+                || !EnableLazyLoading
+                || !DetachSourceWhenOutsideViewport
+                || Source == null
+                || !HasAttachedSource())
+            {
+                return;
+            }
+
+            ImageExDiagnostics.RecordOffscreenDetach(this);
+            AttachSource(null);
+        }
+
+        private void CancelPendingOffscreenDetach()
+        {
+            var tokenSource = _offscreenDetachTokenSource;
+            _offscreenDetachTokenSource = null;
+            if (tokenSource == null)
+            {
+                return;
+            }
+
+            try
+            {
+                tokenSource.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
             }
         }
 

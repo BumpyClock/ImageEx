@@ -49,6 +49,15 @@ namespace ImageEx
         public static readonly DependencyProperty LazyLoadingThresholdProperty = DependencyProperty.Register(nameof(LazyLoadingThreshold), typeof(double), typeof(ImageExBase), new PropertyMetadata(default(double), LazyLoadingThresholdChanged));
 
         /// <summary>
+        /// Identifies the <see cref="DetachSourceWhenOutsideViewport"/> dependency property.
+        /// </summary>
+        public static readonly DependencyProperty DetachSourceWhenOutsideViewportProperty = DependencyProperty.Register(
+            nameof(DetachSourceWhenOutsideViewport),
+            typeof(bool),
+            typeof(ImageExBase),
+            new PropertyMetadata(false, DetachSourceWhenOutsideViewportChanged));
+
+        /// <summary>
         /// Identifies the <see cref="EnableDiskCache"/> dependency property.
         /// </summary>
         public static readonly DependencyProperty EnableDiskCacheProperty = DependencyProperty.Register(nameof(EnableDiskCache), typeof(bool), typeof(ImageExBase), new PropertyMetadata(true));
@@ -91,6 +100,10 @@ namespace ImageEx
         public bool IsInitialized { get; private set; }
 
         public bool HasAttachedSourceForDiagnostics => HasAttachedSource();
+
+        internal bool IsInViewportForDiagnostics => _isInViewport;
+
+        internal bool HasLazyLoadingHandlersForDiagnostics => _lazyLoadingHandlersAttached;
 
         /// <summary>
         /// Gets or sets DecodePixelHeight for underlying bitmap
@@ -157,6 +170,15 @@ namespace ImageEx
         }
 
         /// <summary>
+        /// Gets or sets whether a loaded source detaches after it remains outside the lazy-loading viewport.
+        /// </summary>
+        public bool DetachSourceWhenOutsideViewport
+        {
+            get { return (bool)GetValue(DetachSourceWhenOutsideViewportProperty); }
+            set { SetValue(DetachSourceWhenOutsideViewportProperty, value); }
+        }
+
+        /// <summary>
         /// Gets or sets a value indicating whether disk caching is enabled.
         /// When true (default), images are cached to local storage.
         /// When false, uses the base memory-only caching via BitmapImage.
@@ -202,7 +224,9 @@ namespace ImageEx
                 }
                 else
                 {
+                    control.CancelPendingOffscreenDetach();
                     control.DetachLazyLoadingHandlers();
+                    control.RestartSourceIfNeeded();
                 }
             }
         }
@@ -212,6 +236,29 @@ namespace ImageEx
             if (d is ImageExBase { EnableLazyLoading: true } control)
             {
                 control.InvalidateLazyLoading();
+            }
+        }
+
+        private static void DetachSourceWhenOutsideViewportChanged(
+            DependencyObject d,
+            DependencyPropertyChangedEventArgs e)
+        {
+            if (d is not ImageExBase control)
+            {
+                return;
+            }
+
+            if ((bool)e.NewValue)
+            {
+                if (control.EnableLazyLoading)
+                {
+                    control.InvalidateLazyLoading();
+                }
+            }
+            else
+            {
+                control.CancelPendingOffscreenDetach();
+                control.RestartSourceIfNeeded();
             }
         }
     }
