@@ -167,12 +167,12 @@ namespace ImageEx
         /// Assigns an <see cref="ImageSource"/> to the underlying <see cref="Image"/> in <see cref="ImageExBase"/>.
         /// </summary>
         /// <param name="source"><see cref="ImageSource"/> to assign to the image.</param>
-        private void AttachSource(ImageSource source)
+        private void AttachSource(ImageSource source, bool shouldAnimateLoadedState = true)
         {
             var dispatcherQueue = ImageDispatcherQueue;
             if (dispatcherQueue is { HasThreadAccess: false })
             {
-                if (!dispatcherQueue.TryEnqueue(() => AttachSource(source)))
+                if (!dispatcherQueue.TryEnqueue(() => AttachSource(source, shouldAnimateLoadedState)))
                 {
                     return;
                 }
@@ -195,6 +195,7 @@ namespace ImageEx
                 nextDecodedBytes);
             _currentImageSource = source;
             _diagnosticAttachedSourceBytes = source == null ? 0 : nextDecodedBytes;
+            _shouldAnimateCurrentImage = source == null || shouldAnimateLoadedState;
 
             // Setting the source here raises ImageOpened or ImageFailed because the control
             // registers handlers for both events. Call those methods directly only when another
@@ -220,7 +221,7 @@ namespace ImageEx
             else if (IsLoaded && source is BitmapSource { PixelHeight: > 0, PixelWidth: > 0 })
             {
                 UpdateDiagnosticAttachedSourceBytes();
-                VisualStateManager.GoToState(this, LoadedState, true);
+                VisualStateManager.GoToState(this, LoadedState, _shouldAnimateCurrentImage);
                 ImageExOpened?.Invoke(this, new ImageExOpenedEventArgs());
             }
         }
@@ -375,12 +376,12 @@ namespace ImageEx
             {
                 if (IsCacheEnabled)
                 {
-                    var img = await ProvideCachedResourceAsync(imageUri, requestToken);
+                    var result = await ResolveImageAsync(imageUri, requestToken);
 
-                    if (CanAttachResolvedSource(requestVersion, requestTokenSource, requestToken, img))
+                    if (CanAttachResolvedSource(requestVersion, requestTokenSource, requestToken, result.Image))
                     {
                         // Attach the image only while this request remains active.
-                        AttachSource(img);
+                        AttachSource(result.Image, shouldAnimateLoadedState: !result.IsCacheHit);
                     }
                 }
                 else if (string.Equals(imageUri.Scheme, "data", StringComparison.OrdinalIgnoreCase))
@@ -473,46 +474,25 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Override this method to provide a custom caching strategy for <see cref="ImageExBase"/>.
-        /// The default implementation uses the built-in UWP cache provided by <see cref="BitmapImage"/>
-        /// and the <see cref="Image"/> control. Return the <see cref="ImageSource"/> for the provided URI.
+        /// Override this method to provide a custom image resolution strategy for <see cref="ImageExBase"/>.
+        /// The default implementation uses the platform image cache.
         /// The <see cref="CancellationToken"/> signals that the current request is no longer valid.
         /// For example, the container can be recycled before the original image loads.
         /// </summary>
-        /// <example>
-        /// <code>
-        ///     var propValues = new List&lt;KeyValuePair&lt;string, object>>();
-        ///
-        ///     if (DecodePixelHeight > 0)
-        ///     {
-        ///         propValues.Add(new KeyValuePair&lt;string, object>(nameof(DecodePixelHeight), DecodePixelHeight));
-        ///     }
-        ///     if (DecodePixelWidth > 0)
-        ///     {
-        ///         propValues.Add(new KeyValuePair&lt;string, object>(nameof(DecodePixelWidth), DecodePixelWidth));
-        ///     }
-        ///     if (propValues.Count > 0)
-        ///     {
-        ///         propValues.Add(new KeyValuePair&lt;string, object>(nameof(DecodePixelType), DecodePixelType));
-        ///     }
-        ///
-        ///     // The token lets the cache cancel the request when a new image is requested.
-        ///     return await ImageCache.Instance.GetFromCacheAsync(imageUri, true, token, propValues);
-        /// </code>
-        /// </example>
-        /// <param name="imageUri"><see cref="Uri"/> of the image to load from the cache.</param>
-        /// <param name="token">A <see cref="CancellationToken"/> which is used to signal when the current request is outdated.</param>
-        /// <returns><see cref="Task"/></returns>
-        protected virtual Task<ImageSource> ProvideCachedResourceAsync(Uri imageUri, CancellationToken token)
+        /// <param name="imageUri">The image URI.</param>
+        /// <param name="token">The token that signals an outdated request.</param>
+        /// <returns>The resolved image and its cache status.</returns>
+        protected virtual Task<ImageLoadResult> ResolveImageAsync(Uri imageUri, CancellationToken token)
         {
-            // Use the built-in UWP image cache provided by the Image control.
+            // Use the platform image cache provided by the Image control.
             ImageExDiagnostics.RecordBaseBitmapCreated(imageUri, DecodePixelWidth, DecodePixelHeight, DecodePixelType);
-            return Task.FromResult((ImageSource)ImageExDeferredBitmapSourceRegistry.CreateDeferredBitmapImage(
+            var image = (ImageSource)ImageExDeferredBitmapSourceRegistry.CreateDeferredBitmapImage(
                 imageUri,
                 DecodePixelWidth,
                 DecodePixelHeight,
                 DecodePixelType,
-                BitmapCreateOptions.None));
+                BitmapCreateOptions.None);
+            return Task.FromResult(new ImageLoadResult(image, IsCacheHit: false));
         }
     }
 }

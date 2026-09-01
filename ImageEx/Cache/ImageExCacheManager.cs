@@ -132,7 +132,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     /// Result of a cache lookup, including whether the result came from disk and can skip the shimmer.
     /// </summary>
     /// <param name="Image">The loaded ImageSource, or null on failure.</param>
-    /// <param name="WasCacheHit">True when the result came from the disk cache and can skip the shimmer.</param>
+    /// <param name="WasCacheHit">True when the memory or disk cache supplied the result.</param>
     public record CacheResult(ImageSource? Image, bool WasCacheHit);
 
     internal readonly record struct ImageExCacheDiagnosticsSnapshot(

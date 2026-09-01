@@ -32,43 +32,43 @@
                             Stretch="{TemplateBinding Stretch}" />
                         <VisualStateManager.VisualStateGroups>
                             <VisualStateGroup x:Name="CommonStates">
+                                <VisualStateGroup.Transitions>
+                                    <VisualTransition To="Loaded">
+                                        <Storyboard>
+                                            <DoubleAnimation
+                                                AutoReverse="False"
+                                                BeginTime="0"
+                                                Storyboard.TargetName="Image"
+                                                Storyboard.TargetProperty="Opacity"
+                                                From="0"
+                                                To="1" />
+                                            <DoubleAnimation
+                                                AutoReverse="False"
+                                                BeginTime="0"
+                                                Storyboard.TargetName="PlaceholderImage"
+                                                Storyboard.TargetProperty="Opacity"
+                                                From="1"
+                                                To="0" />
+                                        </Storyboard>
+                                    </VisualTransition>
+                                </VisualStateGroup.Transitions>
                                 <VisualState x:Name="Failed">
-                                    <Storyboard>
-                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetName="Image" Storyboard.TargetProperty="Opacity">
-                                            <DiscreteObjectKeyFrame KeyTime="0" Value="0" />
-                                        </ObjectAnimationUsingKeyFrames>
-                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetName="PlaceholderImage" Storyboard.TargetProperty="Opacity">
-                                            <DiscreteObjectKeyFrame KeyTime="0" Value="1" />
-                                        </ObjectAnimationUsingKeyFrames>
-                                    </Storyboard>
+                                    <VisualState.Setters>
+                                        <Setter Target="Image.Opacity" Value="0" />
+                                        <Setter Target="PlaceholderImage.Opacity" Value="1" />
+                                    </VisualState.Setters>
                                 </VisualState>
                                 <VisualState x:Name="Loading">
-                                    <Storyboard>
-                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetName="Image" Storyboard.TargetProperty="Opacity">
-                                            <DiscreteObjectKeyFrame KeyTime="0" Value="0" />
-                                        </ObjectAnimationUsingKeyFrames>
-                                        <ObjectAnimationUsingKeyFrames Storyboard.TargetName="PlaceholderImage" Storyboard.TargetProperty="Opacity">
-                                            <DiscreteObjectKeyFrame KeyTime="0" Value="1" />
-                                        </ObjectAnimationUsingKeyFrames>
-                                    </Storyboard>
+                                    <VisualState.Setters>
+                                        <Setter Target="Image.Opacity" Value="0" />
+                                        <Setter Target="PlaceholderImage.Opacity" Value="1" />
+                                    </VisualState.Setters>
                                 </VisualState>
                                 <VisualState x:Name="Loaded">
-                                    <Storyboard>
-                                        <DoubleAnimation
-                                            AutoReverse="False"
-                                            BeginTime="0"
-                                            Storyboard.TargetName="Image"
-                                            Storyboard.TargetProperty="Opacity"
-                                            From="0"
-                                            To="1" />
-                                        <DoubleAnimation
-                                            AutoReverse="False"
-                                            BeginTime="0"
-                                            Storyboard.TargetName="PlaceholderImage"
-                                            Storyboard.TargetProperty="Opacity"
-                                            From="1"
-                                            To="0" />
-                                    </Storyboard>
+                                    <VisualState.Setters>
+                                        <Setter Target="Image.Opacity" Value="1" />
+                                        <Setter Target="PlaceholderImage.Opacity" Value="0" />
+                                    </VisualState.Setters>
                                 </VisualState>
                                 <VisualState x:Name="Unloaded" />
                             </VisualStateGroup>

@@ -46,6 +46,7 @@ namespace ImageEx
         private bool _isInViewport;
         private bool _lazyLoadingHandlersAttached;
         private ImageSource _currentImageSource;
+        private bool _shouldAnimateCurrentImage = true;
         private readonly DispatcherQueue _creationDispatcherQueue;
         private long _diagnosticAttachedSourceBytes;
         private CancellationTokenSource _offscreenDetachTokenSource;
@@ -188,7 +189,7 @@ namespace ImageEx
                     DetachLazyLoadingHandlers();
                 }
 
-                AttachSource(_currentImageSource);
+                AttachSource(_currentImageSource, _shouldAnimateCurrentImage);
             }
             else if (HasCurrentRequest())
             {
@@ -244,7 +245,7 @@ namespace ImageEx
         protected virtual void OnImageOpened(object sender, RoutedEventArgs e)
         {
             UpdateDiagnosticAttachedSourceBytes();
-            VisualStateManager.GoToState(this, LoadedState, true);
+            VisualStateManager.GoToState(this, LoadedState, _shouldAnimateCurrentImage);
             ImageExOpened?.Invoke(this, new ImageExOpenedEventArgs());
         }
 

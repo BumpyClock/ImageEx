@@ -26,29 +26,29 @@ namespace ImageEx
         }
 
         /// <summary>
-        /// Provides cached image resources with optional disk caching and shimmer-skip optimization.
+        /// Resolves an image and reports whether the memory or disk cache supplied it.
         /// </summary>
         /// <param name="imageUri">The URI of the image to load.</param>
         /// <param name="token">Cancellation token for the async operation.</param>
-        /// <returns>The loaded ImageSource, or null to fall back to base behavior.</returns>
-        protected override async Task<ImageSource> ProvideCachedResourceAsync(Uri imageUri, CancellationToken token)
+        /// <returns>The resolved image and its cache status.</returns>
+        protected override async Task<ImageLoadResult> ResolveImageAsync(Uri imageUri, CancellationToken token)
         {
             // Use the base memory-only cache when disk caching is disabled.
             if (!EnableDiskCache)
             {
-                return await base.ProvideCachedResourceAsync(imageUri, token);
+                return await base.ResolveImageAsync(imageUri, token);
             }
 
             // Let the base control handle local and embedded resources.
             if (!imageUri.IsAbsoluteUri ||
                 imageUri.Scheme is "ms-appx" or "ms-resource" or "ms-appdata" or "data" or "file")
             {
-                return await base.ProvideCachedResourceAsync(imageUri, token);
+                return await base.ResolveImageAsync(imageUri, token);
             }
 
             if (ImageExDiagnostics.DisableHttpImages)
             {
-                return null;
+                return new ImageLoadResult(null, IsCacheHit: false);
             }
 
             // Configure the cache manager from dependency properties.
@@ -75,27 +75,20 @@ namespace ImageEx
                 dpiScale,
                 returnNullOnCancellation: true);
 
-            // If a newer source, a null source, or unload superseded this request, suppress the
-            // cache-hit shimmer transition and fallback attach. Returning null lets
-            // LoadImageAsync's IsRequestCurrent guard drop the stale result.
+            // A newer source, null source, or unload can supersede this request.
+            // LoadImageAsync drops this empty result after its request-state check.
             if (token.IsCancellationRequested)
             {
-                return null;
-            }
-
-            // Skip the shimmer animation on a cache hit by going directly to the Loaded state.
-            if (result.WasCacheHit && result.Image != null)
-            {
-                VisualStateManager.GoToState(this, LoadedState, useTransitions: false);
+                return new ImageLoadResult(null, IsCacheHit: false);
             }
 
             if (result.Image != null)
             {
-                return result.Image;
+                return new ImageLoadResult(result.Image, result.WasCacheHit);
             }
 
             ImageExDiagnostics.RecordHttpFallback(imageUri, DecodePixelWidth, DecodePixelHeight, DecodePixelType);
-            return null;
+            return new ImageLoadResult(null, IsCacheHit: false);
         }
     }
 }
