@@ -20,6 +20,7 @@ namespace ImageEx
         private long _sourceRequestVersion;
 
         private object _lazyLoadingSource;
+        private bool _loadedViewportCheckQueued;
 
         /// <summary>
         /// Gets or sets the source used by the image.
@@ -34,7 +35,14 @@ namespace ImageEx
 
         private void OnImageExUnloaded(object sender, RoutedEventArgs e)
         {
+            // A queued Unloaded event can arrive after the control has loaded again.
+            if (IsLoaded)
+            {
+                return;
+            }
+
             _isInViewport = false;
+            _lastEffectiveViewport = null;
             Interlocked.Increment(ref _viewportStateGeneration);
             CancelPendingOffscreenDetach();
             CleanupTokenSource();
@@ -47,6 +55,32 @@ namespace ImageEx
 
         private void OnImageExLoaded(object sender, RoutedEventArgs e)
         {
+            if (_loadedViewportCheckQueued)
+            {
+                return;
+            }
+
+            // InlineUIContainer can raise Loaded before its viewport geometry settles.
+            _loadedViewportCheckQueued = true;
+            var dispatcherQueue = ImageDispatcherQueue;
+            if (dispatcherQueue == null || !dispatcherQueue.TryEnqueue(() =>
+            {
+                _loadedViewportCheckQueued = false;
+                RefreshLoadedSource();
+            }))
+            {
+                _loadedViewportCheckQueued = false;
+                System.Diagnostics.Debug.WriteLine("[ImageEx] Dispatcher rejected the initial viewport check.");
+            }
+        }
+
+        private void RefreshLoadedSource()
+        {
+            if (!IsLoaded || Source == null)
+            {
+                return;
+            }
+
             if (EnableLazyLoading)
             {
                 InvalidateLazyLoading();
