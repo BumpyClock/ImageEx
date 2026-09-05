@@ -50,6 +50,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private TaskCompletionSource? _operationsDrained;
     private Task? _disposeTask;
     private const int TelemetrySampleInterval = 50;
+    private const int MaxRasterDecodeBytes = 8 * 1024 * 1024;
+    private const int MaxRasterDecodePixels = MaxRasterDecodeBytes / 4;
     private const int MaxSmallDecodedImageCacheEntries = 128;
     private const long MaxSmallDecodedImageCacheBytes = 32L * 1024 * 1024;
     private const long MaxSmallDecodedImageCacheEntryBytes = 2L * 1024 * 1024;
@@ -158,8 +160,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private readonly record struct DecodeDimensions(
         int TargetWidth,
         int TargetHeight,
-        int NaturalWidth,
-        int NaturalHeight);
+        uint NaturalWidth,
+        uint NaturalHeight);
 
     private sealed class SharedDownload : IDisposable
     {
@@ -1301,8 +1303,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         try
         {
             var decoder = await BitmapDecoder.CreateAsync(stream).AsTask().ConfigureAwait(false);
-            var naturalWidth = (int)decoder.OrientedPixelWidth;
-            var naturalHeight = (int)decoder.OrientedPixelHeight;
+            var naturalWidth = decoder.OrientedPixelWidth;
+            var naturalHeight = decoder.OrientedPixelHeight;
             if (naturalWidth <= 0 || naturalHeight <= 0)
             {
                 Debug.WriteLine("[ImageExCache] Failed to read natural image size for prescale.");
@@ -1311,26 +1313,9 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                     : new DecodeDimensions(0, 0, 0, 0);
             }
 
-            if (decodeWidth <= 0 && decodeHeight <= 0)
-            {
-                var fallbackWidth = ResolveFallbackDecodeWidth(dpiScale);
-                var fallbackHeight = Math.Max(1, (int)Math.Round(fallbackWidth * (naturalHeight / (double)naturalWidth)));
-                return new DecodeDimensions(fallbackWidth, fallbackHeight, naturalWidth, naturalHeight);
-            }
-
-            if (decodeWidth > 0 && decodeHeight > 0)
-            {
-                return new DecodeDimensions(decodeWidth, decodeHeight, naturalWidth, naturalHeight);
-            }
-
-            if (decodeWidth > 0)
-            {
-                var scaledHeight = Math.Max(1, (int)Math.Round(decodeWidth * (naturalHeight / (double)naturalWidth)));
-                return new DecodeDimensions(decodeWidth, scaledHeight, naturalWidth, naturalHeight);
-            }
-
-            var scaledWidth = Math.Max(1, (int)Math.Round(decodeHeight * (naturalWidth / (double)naturalHeight)));
-            return new DecodeDimensions(scaledWidth, decodeHeight, naturalWidth, naturalHeight);
+            var (targetWidth, targetHeight) = ResolveRasterDecodeSize(
+                naturalWidth, naturalHeight, decodeWidth, decodeHeight, dpiScale);
+            return new DecodeDimensions(targetWidth, targetHeight, naturalWidth, naturalHeight);
         }
         catch (OperationCanceledException) when (returnNullOnCancellation)
         {
@@ -1348,6 +1333,57 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 ? null
                 : new DecodeDimensions(0, 0, 0, 0);
         }
+    }
+
+    internal static (int Width, int Height) ResolveRasterDecodeSize(
+        uint naturalWidth,
+        uint naturalHeight,
+        int decodeWidth,
+        int decodeHeight,
+        double dpiScale)
+    {
+        ArgumentOutOfRangeException.ThrowIfZero(naturalWidth);
+        ArgumentOutOfRangeException.ThrowIfZero(naturalHeight);
+
+        double targetWidth = decodeWidth;
+        double targetHeight = decodeHeight;
+        if (targetWidth <= 0 && targetHeight <= 0)
+        {
+            targetWidth = ResolveFallbackDecodeWidth(dpiScale);
+        }
+
+        if (targetWidth <= 0)
+        {
+            targetWidth = Math.Max(1, Math.Round(targetHeight * (naturalWidth / (double)naturalHeight)));
+        }
+        else if (targetHeight <= 0)
+        {
+            targetHeight = Math.Max(1, Math.Round(targetWidth * (naturalHeight / (double)naturalWidth)));
+        }
+
+        if (targetWidth * targetHeight > MaxRasterDecodePixels)
+        {
+            var scale = Math.Sqrt(MaxRasterDecodePixels / (targetWidth * targetHeight));
+            targetWidth = Math.Max(1, Math.Floor(targetWidth * scale));
+            targetHeight = Math.Max(1, Math.Floor(targetHeight * scale));
+        }
+
+        // The one-pixel minimum can exceed the area budget for extreme aspect ratios.
+        var width = (int)Math.Min(targetWidth, MaxRasterDecodePixels);
+        var height = (int)Math.Min(targetHeight, MaxRasterDecodePixels);
+        if ((long)width * height > MaxRasterDecodePixels)
+        {
+            if (width >= height)
+            {
+                width = MaxRasterDecodePixels / height;
+            }
+            else
+            {
+                height = MaxRasterDecodePixels / width;
+            }
+        }
+
+        return (width, height);
     }
 
     private static async Task<ImageSource?> CreatePrescaledBitmapAsync(
@@ -1372,10 +1408,20 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         var stage = "start";
         try
         {
+            stage = "validate-target";
+            if (dimensions.TargetWidth <= 0 ||
+                dimensions.TargetHeight <= 0 ||
+                (long)dimensions.TargetWidth * dimensions.TargetHeight > MaxRasterDecodePixels)
+            {
+                Debug.WriteLine("[ImageExCache] Raster target exceeds the pixel budget or has invalid dimensions.");
+                return null;
+            }
+
+            var expectedBytes = checked(dimensions.TargetWidth * dimensions.TargetHeight * 4);
             stage = "decoder-create";
             var decoder = await BitmapDecoder.CreateAsync(sourceStream).AsTask().ConfigureAwait(false);
-            var sourceWidth = (int)decoder.PixelWidth;
-            var sourceHeight = (int)decoder.PixelHeight;
+            var sourceWidth = decoder.PixelWidth;
+            var sourceHeight = decoder.PixelHeight;
             var orientationSwapsAxes = sourceWidth > 0 &&
                 sourceHeight > 0 &&
                 (sourceWidth != dimensions.NaturalWidth || sourceHeight != dimensions.NaturalHeight);
@@ -1403,7 +1449,6 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 ColorManagementMode.DoNotColorManage).AsTask().ConfigureAwait(false);
 
             var pixels = pixelData.DetachPixelData();
-            var expectedBytes = checked(dimensions.TargetWidth * dimensions.TargetHeight * 4);
             if (pixels.Length != expectedBytes)
             {
                 Debug.WriteLine(
@@ -1564,8 +1609,13 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
     private static int ResolveFallbackDecodeWidth(double dpiScale)
     {
+        if (double.IsNaN(dpiScale))
+        {
+            throw new ArgumentOutOfRangeException(nameof(dpiScale));
+        }
+
         // Clamp the DPI scale to 0.5x through 4.0x to prevent extreme decode sizes.
-        var clampedDpiScale = Math.Max(0.5, Math.Min(4.0, dpiScale));
+        var clampedDpiScale = Math.Clamp(dpiScale, 0.5, 4.0);
         return (int)Math.Round(400 * clampedDpiScale);
     }
 
