@@ -73,6 +73,14 @@ namespace ImageEx
                 DisableHttpFallback);
         }
 
+        /// <summary>
+        /// Writes image counters, cache state, and process memory to the debug output.
+        /// </summary>
+        /// <remarks>
+        /// The compiler omits this call and its arguments when the caller does not define DEBUG.
+        /// Use <see cref="CaptureSnapshot"/> to read counters in either build configuration.
+        /// </remarks>
+        [Conditional("DEBUG")]
         public static void LogSnapshot(string context)
         {
             LogSnapshot(context, CaptureSnapshot());
@@ -312,6 +320,10 @@ namespace ImageEx
             return bytes / (1024.0 * 1024.0);
         }
 
+        /// <summary>
+        /// Reads dispatcher-owned image properties for debug output without interrupting the image lifecycle.
+        /// </summary>
+        [Conditional("DEBUG")]
         private static void LogSourceEvent(ImageExBase control, string context, ImageSource? source, long sourceDecodedBytes)
         {
             try

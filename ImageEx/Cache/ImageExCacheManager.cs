@@ -1972,6 +1972,10 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         return count == 1 || ShouldSample(count);
     }
 
+    /// <summary>
+    /// Samples process memory and writes cache counters to the debug output without changing those counters.
+    /// </summary>
+    [Conditional("DEBUG")]
     private static void LogTelemetry(
         string reason,
         Uri? uri,
