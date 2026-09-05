@@ -4,6 +4,12 @@ The ImageEx control extends the platform Image control. It loads source images a
 
 ImageEx accepts at most 8 MiB of source bytes for each raster or SVG response. It rejects larger declared responses before reading and stops chunked responses at the limit.
 
+Raster byte and file decodes use at most 2,097,152 physical pixels, or 8 MiB of BGRA data.
+Logical decode dimensions use the supplied DPI scale, clamped to 0.5 through 4.0, before the pixel limit applies.
+Physical decode dimensions do not receive this scale.
+With no explicit dimensions, the fallback width receives the DPI scale once.
+The pixel limit does not bound codec buffers, SVG images, or native URI decodes.
+
 This package contains a separate ImageEx control from the Windows Community Toolkit 7.x package.
 Since this control was removed in Toolkit version 8.0, this package was created containing only this control and having no dependencies.
 Originally developed by Microsoft.Toolkit

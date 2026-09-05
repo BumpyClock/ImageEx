@@ -276,7 +276,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     /// <param name="decodeType">Decode pixel type.</param>
     /// <param name="token">Cancellation token.</param>
     /// <param name="dispatcherQueue">Optional dispatcher queue for UI thread marshaling.</param>
-    /// <param name="dpiScale">Optional DPI scale factor (e.g., 1.0, 1.5, 2.0) for adaptive fallback sizing.</param>
+    /// <param name="dpiScale">DPI scale factor for logical decode dimensions and adaptive fallback width, clamped to 0.5 through 4.0.</param>
     /// <returns>CacheResult with the image and cache hit status.</returns>
     public async Task<CacheResult> GetOrLoadImageAsync(
         Uri uri,
@@ -1244,7 +1244,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         }
 
         using var bitmapStream = stream.AsRandomAccessStream();
-        var dimensions = await ResolveDecodeDimensionsAsync(bitmapStream, decodeWidth, decodeHeight, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
+        var dimensions = await ResolveDecodeDimensionsAsync(bitmapStream, decodeWidth, decodeHeight, decodeType, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
         if (dimensions == null)
         {
             return null;
@@ -1286,6 +1286,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         IRandomAccessStream stream,
         int decodeWidth,
         int decodeHeight,
+        DecodePixelType decodeType,
         double dpiScale,
         CancellationToken token,
         bool returnNullOnCancellation)
@@ -1314,7 +1315,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             }
 
             var (targetWidth, targetHeight) = ResolveRasterDecodeSize(
-                naturalWidth, naturalHeight, decodeWidth, decodeHeight, dpiScale);
+                naturalWidth, naturalHeight, decodeWidth, decodeHeight, decodeType, dpiScale);
             return new DecodeDimensions(targetWidth, targetHeight, naturalWidth, naturalHeight);
         }
         catch (OperationCanceledException) when (returnNullOnCancellation)
@@ -1340,6 +1341,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         uint naturalHeight,
         int decodeWidth,
         int decodeHeight,
+        DecodePixelType decodeType,
         double dpiScale)
     {
         ArgumentOutOfRangeException.ThrowIfZero(naturalWidth);
@@ -1350,6 +1352,24 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         if (targetWidth <= 0 && targetHeight <= 0)
         {
             targetWidth = ResolveFallbackDecodeWidth(dpiScale);
+        }
+        else if (decodeType == DecodePixelType.Logical)
+        {
+            if (double.IsNaN(dpiScale))
+            {
+                throw new ArgumentOutOfRangeException(nameof(dpiScale));
+            }
+
+            var scale = Math.Clamp(dpiScale, 0.5, 4.0);
+            if (targetWidth > 0)
+            {
+                targetWidth = Math.Max(1, Math.Round(targetWidth * scale));
+            }
+
+            if (targetHeight > 0)
+            {
+                targetHeight = Math.Max(1, Math.Round(targetHeight * scale));
+            }
         }
 
         if (targetWidth <= 0)
