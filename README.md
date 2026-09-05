@@ -10,6 +10,10 @@ Physical decode dimensions do not receive this scale.
 With no explicit dimensions, the fallback width receives the DPI scale once.
 The pixel limit does not bound codec buffers, SVG images, or native URI decodes.
 
+Debug builds collect detailed image and cache logs with process-memory samples.
+Release builds omit these log calls and their argument evaluation.
+Diagnostic counters and the `CaptureSnapshot` API remain available in both configurations.
+
 This package contains a separate ImageEx control from the Windows Community Toolkit 7.x package.
 Since this control was removed in Toolkit version 8.0, this package was created containing only this control and having no dependencies.
 Originally developed by Microsoft.Toolkit

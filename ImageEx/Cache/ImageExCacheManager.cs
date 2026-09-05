@@ -1972,6 +1972,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         return count == 1 || ShouldSample(count);
     }
 
+    [Conditional("DEBUG")]
     private static void LogTelemetry(
         string reason,
         Uri? uri,

@@ -73,6 +73,7 @@ namespace ImageEx
                 DisableHttpFallback);
         }
 
+        [Conditional("DEBUG")]
         public static void LogSnapshot(string context)
         {
             LogSnapshot(context, CaptureSnapshot());
@@ -312,6 +313,7 @@ namespace ImageEx
             return bytes / (1024.0 * 1024.0);
         }
 
+        [Conditional("DEBUG")]
         private static void LogSourceEvent(ImageExBase control, string context, ImageSource? source, long sourceDecodedBytes)
         {
             try
