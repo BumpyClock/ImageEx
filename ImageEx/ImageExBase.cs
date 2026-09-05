@@ -51,6 +51,7 @@ namespace ImageEx
         private long _diagnosticAttachedSourceBytes;
         private CancellationTokenSource _offscreenDetachTokenSource;
         private long _viewportStateGeneration;
+        private Rect? _lastEffectiveViewport;
         private static readonly TimeSpan OffscreenDetachGracePeriod = TimeSpan.FromMilliseconds(250);
 
         /// <summary>
@@ -262,7 +263,13 @@ namespace ImageEx
 
         private void ImageExBase_EffectiveViewportChanged(FrameworkElement sender, EffectiveViewportChangedEventArgs args)
         {
+            _lastEffectiveViewport = args.EffectiveViewport;
             InvalidateLazyLoading(args.EffectiveViewport);
+        }
+
+        private void ImageExBase_LazyLoadingSizeChanged(object sender, SizeChangedEventArgs args)
+        {
+            InvalidateLazyLoading();
         }
 
         private void InvalidateLazyLoading()
@@ -273,15 +280,25 @@ namespace ImageEx
                 return;
             }
 
-            // Find the first ascendant ScrollViewer, if not found, use the root element.
-            FrameworkElement hostElement = null;
-            var ascendants = this.FindAscendants().OfType<FrameworkElement>();
-            foreach (var ascendant in ascendants)
+            if (_lastEffectiveViewport is { } viewport)
             {
-                hostElement = ascendant;
-                if (hostElement is ScrollViewer)
+                InvalidateLazyLoading(viewport);
+                return;
+            }
+
+            // InlineUIContainer is a logical parent, not a visual ancestor.
+            FrameworkElement hostElement = null;
+            for (var ancestor = VisualTreeHelper.GetParent(this);
+                ancestor != null;
+                ancestor = VisualTreeHelper.GetParent(ancestor))
+            {
+                if (ancestor is FrameworkElement element)
                 {
-                    break;
+                    hostElement = element;
+                    if (element is ScrollViewer)
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -497,6 +514,7 @@ namespace ImageEx
             }
 
             EffectiveViewportChanged += ImageExBase_EffectiveViewportChanged;
+            SizeChanged += ImageExBase_LazyLoadingSizeChanged;
             _lazyLoadingHandlersAttached = true;
         }
 
@@ -508,6 +526,8 @@ namespace ImageEx
             }
 
             EffectiveViewportChanged -= ImageExBase_EffectiveViewportChanged;
+            SizeChanged -= ImageExBase_LazyLoadingSizeChanged;
+            _lastEffectiveViewport = null;
             _lazyLoadingHandlersAttached = false;
         }
     }
