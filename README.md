@@ -15,7 +15,7 @@ Release builds omit these log calls and their argument evaluation.
 Diagnostic counters and the `CaptureSnapshot` API remain available in both configurations.
 
 The project explicitly declares `win-x86`, `win-x64`, and `win-arm64` runtime identifiers so NuGet restore does not depend on package build imports.
-The committed lockfile includes all three runtime targets. Use `dotnet restore ImageEx\ImageEx.csproj --locked-mode -p:Platform=x64` to require the recorded dependency graph.
+The committed lockfile includes all three runtime targets. In PowerShell, use `dotnet restore ImageEx\ImageEx.csproj --locked-mode -p:Platform=x64` to require the recorded dependency graph.
 
 This package contains a separate ImageEx control from the Windows Community Toolkit 7.x package.
 Since this control was removed in Toolkit version 8.0, this package was created containing only this control and having no dependencies.
