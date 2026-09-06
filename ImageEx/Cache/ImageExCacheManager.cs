@@ -35,7 +35,10 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private readonly ImageExDiskCache _diskCache;
     private readonly HttpClient _httpClient;
     private readonly ConcurrentDictionary<string, Lazy<SharedDownload>> _inFlightDownloads = new();
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _recentDownloadFailures = new();
+    private readonly Dictionary<string, LinkedListNode<DownloadFailure>> _recentDownloadFailures = new();
+    private readonly LinkedList<DownloadFailure> _downloadFailureOrder = new();
+    private readonly object _downloadFailuresGate = new();
+    private readonly TimeProvider _timeProvider;
     private readonly Dictionary<string, CacheWriteLock> _cacheWriteLocks = new();
     private readonly object _cacheWriteLocksGate = new();
     private readonly SemaphoreSlim _cleanupLock = new(1, 1);
@@ -56,6 +59,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private const long MaxSmallDecodedImageCacheBytes = 32L * 1024 * 1024;
     private const long MaxSmallDecodedImageCacheEntryBytes = 2L * 1024 * 1024;
     private const int MaxSmallDecodedImageCacheDimension = 512;
+    private const int MaxRecentDownloadFailures = 1024;
     private static readonly TimeSpan DownloadFailureBackoff = TimeSpan.FromMinutes(10);
     private readonly object _smallDecodedImageCacheLock = new();
     private readonly Dictionary<string, SmallDecodedImageCacheEntry> _smallDecodedImageCache = new();
@@ -84,6 +88,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private static long _telemetryPeakActiveDecodeCount;
 
     private sealed record SmallDecodedImageCacheEntry(ImageSource Image, LinkedListNode<string> LruNode, long SizeBytes);
+    private readonly record struct DownloadFailure(string CacheKey, long Timestamp);
 
     private sealed class CacheWriteLock : IDisposable
     {
@@ -117,8 +122,10 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         HttpMessageHandler? httpMessageHandler = null,
         int maxConcurrentDownloads = 2,
         int maxConcurrentDecodes = 2,
-        long maximumSourceBytes = ImageExCacheConstants.DefaultMaximumSourceBytes)
+        long maximumSourceBytes = ImageExCacheConstants.DefaultMaximumSourceBytes,
+        TimeProvider? timeProvider = null)
     {
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _diskCache = new ImageExDiskCache(cacheDirectory);
         _httpClient = httpMessageHandler == null
             ? new HttpClient { Timeout = TimeSpan.FromSeconds(30) }
@@ -145,7 +152,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         int CacheWriteLockCount,
         long CacheWriteLockRemovals,
         int DiskCacheEntryCount,
-        long DiskCacheBytes);
+        long DiskCacheBytes,
+        int RecentDownloadFailures);
 
     internal sealed record DownloadedBytes(byte[] Buffer, int Length)
     {
@@ -231,7 +239,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     {
         return s_instance.IsValueCreated
             ? s_instance.Value.CaptureDiagnosticsSnapshotCore()
-            : new ImageExCacheDiagnosticsSnapshot(false, 0, 0, 0, 0, 0, 0, 0);
+            : new ImageExCacheDiagnosticsSnapshot(false, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
     internal ImageExCacheDiagnosticsSnapshot CaptureInstanceDiagnosticsSnapshot()
@@ -255,6 +263,12 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             cacheWriteLockCount = _cacheWriteLocks.Count;
         }
 
+        int recentDownloadFailures;
+        lock (_downloadFailuresGate)
+        {
+            recentDownloadFailures = _recentDownloadFailures.Count;
+        }
+
         var diskEntries = _diskCache.GetAllEntries().ToArray();
         return new ImageExCacheDiagnosticsSnapshot(
             true,
@@ -264,7 +278,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             cacheWriteLockCount,
             Interlocked.Read(ref _telemetryCacheWriteLockRemovalCount),
             diskEntries.Length,
-            diskEntries.Sum(entry => entry.Value.SizeBytes));
+            diskEntries.Sum(entry => entry.Value.SizeBytes),
+            recentDownloadFailures);
     }
 
     /// <summary>
@@ -299,6 +314,11 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         // Skip non-HTTP URIs. Return null so the base pipeline handles them.
         if (!uri.IsHttpUri())
             return new CacheResult(null, false);
+
+        lock (_downloadFailuresGate)
+        {
+            RemoveExpiredDownloadFailures(_timeProvider.GetTimestamp());
+        }
 
         var isSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase);
         var cacheKey = ImageExDiskCache.ComputeSourceCacheKey(uri);
@@ -638,12 +658,6 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
             try
             {
-                if (returnNullOnCancellation)
-                {
-                    var result = await WaitForDownloadOrCancellationAsync(sharedDownload.Task, token).ConfigureAwait(false);
-                    return result ?? new DownloadResult(null, null);
-                }
-
                 return await sharedDownload.Task.WaitAsync(token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (returnNullOnCancellation)
@@ -663,52 +677,61 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
     private bool IsRecentDownloadFailure(string cacheKey)
     {
-        if (!_recentDownloadFailures.TryGetValue(cacheKey, out var failedAt))
+        lock (_downloadFailuresGate)
         {
-            return false;
+            RemoveExpiredDownloadFailures(_timeProvider.GetTimestamp());
+            return _recentDownloadFailures.ContainsKey(cacheKey);
         }
-
-        if (DateTimeOffset.UtcNow - failedAt < DownloadFailureBackoff)
-        {
-            return true;
-        }
-
-        _recentDownloadFailures.TryRemove(cacheKey, out _);
-        return false;
     }
 
     private void RememberDownloadFailure(string cacheKey)
     {
-        _recentDownloadFailures[cacheKey] = DateTimeOffset.UtcNow;
+        lock (_downloadFailuresGate)
+        {
+            var now = _timeProvider.GetTimestamp();
+            RemoveExpiredDownloadFailures(now);
+            if (_recentDownloadFailures.Remove(cacheKey, out var existing))
+            {
+                _downloadFailureOrder.Remove(existing);
+            }
+
+            if (_recentDownloadFailures.Count == MaxRecentDownloadFailures)
+            {
+                RemoveOldestDownloadFailure();
+            }
+
+            _recentDownloadFailures.Add(
+                cacheKey,
+                _downloadFailureOrder.AddLast(new DownloadFailure(cacheKey, now)));
+        }
     }
 
     private void ForgetDownloadFailure(string cacheKey)
     {
-        _recentDownloadFailures.TryRemove(cacheKey, out _);
+        lock (_downloadFailuresGate)
+        {
+            if (_recentDownloadFailures.Remove(cacheKey, out var existing))
+            {
+                _downloadFailureOrder.Remove(existing);
+            }
+        }
     }
 
-    private static async Task<DownloadResult?> WaitForDownloadOrCancellationAsync(
-        Task<DownloadResult> downloadTask,
-        CancellationToken token)
+    // The gate protects both indexes. Monotonic failure order permits prefix-only expiry without a timer.
+    private void RemoveExpiredDownloadFailures(long now)
     {
-        if (downloadTask.IsCompleted || !token.CanBeCanceled)
+        while (_downloadFailureOrder.First is { } oldest &&
+            _timeProvider.GetElapsedTime(oldest.Value.Timestamp, now) >= DownloadFailureBackoff)
         {
-            return await downloadTask.ConfigureAwait(false);
+            RemoveOldestDownloadFailure();
         }
+    }
 
-        if (token.IsCancellationRequested)
-        {
-            return null;
-        }
-
-        var cancellationTask = Task.Delay(Timeout.InfiniteTimeSpan, token);
-        var completedTask = await Task.WhenAny(downloadTask, cancellationTask).ConfigureAwait(false);
-        if (completedTask != downloadTask)
-        {
-            return null;
-        }
-
-        return await downloadTask.ConfigureAwait(false);
+    private void RemoveOldestDownloadFailure()
+    {
+        var oldest = _downloadFailureOrder.First!;
+        _recentDownloadFailures.Remove(oldest.Value.CacheKey);
+        _downloadFailureOrder.RemoveFirst();
     }
 
     private Lazy<SharedDownload> CreateSharedDownloadLazy(string cacheKey, Uri uri)
