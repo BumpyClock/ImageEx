@@ -334,7 +334,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                     }
 
                     var cachedIsSvg = entry.Extension == ".svg";
-                    var image = await LoadFromFileAsync(cacheKey, filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
+                    var image = await LoadFromFileAsync(filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
 
                     if (image != null)
                     {
@@ -1074,7 +1074,6 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     }
 
     private async Task<ImageSource?> LoadFromFileAsync(
-        string cacheKey,
         string filePath,
         bool isSvg,
         int decodeWidth,
@@ -1257,9 +1256,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             var decodedBitmap = await CreatePrescaledBitmapAsync(
                 bitmapStream,
                 dimensions.Value,
-                decodeType,
                 dispatcherQueue,
-                dpiScale,
                 token,
                 returnNullOnCancellation);
             if (decodedBitmap == null)
@@ -1409,9 +1406,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private static async Task<ImageSource?> CreatePrescaledBitmapAsync(
         IRandomAccessStream sourceStream,
         DecodeDimensions dimensions,
-        DecodePixelType decodeType,
         DispatcherQueue? dispatcherQueue,
-        double dpiScale,
         CancellationToken token,
         bool returnNullOnCancellation)
     {
@@ -1537,34 +1532,6 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         });
     }
 
-    private static Task<ImageSource?> LoadBitmapImageOnDispatcherAsync(
-        IRandomAccessStream bitmapStream,
-        int decodeWidth,
-        int decodeHeight,
-        DecodePixelType decodeType,
-        DispatcherQueue? dispatcherQueue,
-        double dpiScale,
-        CancellationToken token,
-        bool returnNullOnCancellation)
-    {
-        return RunOnDispatcherAsync<ImageSource?>(dispatcherQueue, async () =>
-        {
-            if (token.IsCancellationRequested)
-            {
-                if (returnNullOnCancellation)
-                {
-                    return null;
-                }
-
-                token.ThrowIfCancellationRequested();
-            }
-
-            var bitmap = CreateBitmapImage(decodeWidth, decodeHeight, decodeType, dpiScale, BitmapCreateOptions.IgnoreImageCache);
-            await bitmap.SetSourceAsync(bitmapStream);
-            return bitmap;
-        });
-    }
-
     private static Task<ImageSource?> CreateWriteableBitmapOnDispatcherAsync(
         DispatcherQueue? dispatcherQueue,
         DecodeDimensions dimensions,
@@ -1593,38 +1560,6 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             bitmap.Invalidate();
             return bitmap;
         });
-    }
-
-    private static BitmapImage CreateBitmapImage(
-        int decodeWidth,
-        int decodeHeight,
-        DecodePixelType decodeType,
-        double dpiScale,
-        BitmapCreateOptions createOptions)
-    {
-        var targetWidth = decodeWidth;
-        var targetHeight = decodeHeight;
-
-        // Use a DPI-aware fallback when no decode size is provided.
-        // A 400-pixel base size at 1x DPI balances quality and memory for feed images and thumbnails.
-        // Scale the fallback linearly with DPI: 1.0x=400px, 1.5x=600px, 2.0x=800px, 3.0x=1200px.
-        // This avoids full-resolution memory use and visible pixelation on high-DPI displays.
-        // Set DecodePixelWidth or DecodePixelHeight on ImageEx for precise decode control.
-        if (targetWidth <= 0 && targetHeight <= 0)
-        {
-            targetWidth = ResolveFallbackDecodeWidth(dpiScale);
-        }
-
-        var bitmap = new BitmapImage
-        {
-            DecodePixelType = decodeType,
-            CreateOptions = createOptions
-        };
-
-        if (targetWidth > 0) bitmap.DecodePixelWidth = targetWidth;
-        if (targetHeight > 0) bitmap.DecodePixelHeight = targetHeight;
-
-        return bitmap;
     }
 
     private static int ResolveFallbackDecodeWidth(double dpiScale)

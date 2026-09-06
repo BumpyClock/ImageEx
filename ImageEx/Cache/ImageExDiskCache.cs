@@ -312,8 +312,6 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
         while (true)
         {
             TimeSpan delay;
-            long version;
-            Dictionary<string, CacheEntry> snapshot;
             lock (_writerGate)
             {
                 if (_persistedMetadataVersion >= _metadataVersion)
@@ -330,8 +328,6 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
                         _lastDirtyUtc + _metadataDebounce,
                         _firstDirtyUtc + _metadataMaximumDelay);
                 delay = dueUtc > now ? dueUtc - now : TimeSpan.Zero;
-                version = _metadataVersion;
-                snapshot = _metadata.ToDictionary(entry => entry.Key, entry => entry.Value);
             }
 
             if (delay > TimeSpan.Zero && await _metadataSignal.WaitAsync(delay).ConfigureAwait(false))
@@ -341,6 +337,21 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
 
             while (_metadataSignal.Wait(0))
             {
+            }
+
+            long version;
+            Dictionary<string, CacheEntry> snapshot;
+            lock (_writerGate)
+            {
+                if (!_forceFlush && DateTimeOffset.UtcNow < Min(
+                    _lastDirtyUtc + _metadataDebounce,
+                    _firstDirtyUtc + _metadataMaximumDelay))
+                {
+                    continue;
+                }
+
+                version = _metadataVersion;
+                snapshot = _metadata.ToDictionary(entry => entry.Key, entry => entry.Value);
             }
 
             try
