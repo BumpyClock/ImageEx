@@ -343,6 +343,13 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
             Dictionary<string, CacheEntry> snapshot;
             lock (_writerGate)
             {
+                if (!_forceFlush && DateTimeOffset.UtcNow < Min(
+                    _lastDirtyUtc + _metadataDebounce,
+                    _firstDirtyUtc + _metadataMaximumDelay))
+                {
+                    continue;
+                }
+
                 version = _metadataVersion;
                 snapshot = _metadata.ToDictionary(entry => entry.Key, entry => entry.Value);
             }
