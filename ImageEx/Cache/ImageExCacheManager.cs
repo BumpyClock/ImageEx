@@ -433,7 +433,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private async Task<ImageSource?> TryLoadDiskEntryAsync(
         string key, Uri uri, CacheEntry entry, int decodeWidth, int decodeHeight,
         DecodePixelType decodeType, DispatcherQueue? dispatcherQueue, double dpiScale,
-        CancellationToken token, bool returnNullOnCancellation)
+        CancellationToken token, bool returnNullOnCancellation, ImageRequestMode mode = ImageRequestMode.Cached)
     {
         var path = _diskCache.GetFilePath(key, entry.Extension);
         if ((DateTimeOffset.UtcNow - entry.DownloadedUtc).TotalDays < MaxCacheDays && File.Exists(path))
@@ -444,7 +444,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             if (image != null)
             {
                 await StoreSmallDecodedImageAsync(uri, decodeWidth, decodeHeight, decodeType,
-                    isSvg, dpiScale, image, dispatcherQueue).ConfigureAwait(false);
+                    isSvg, dpiScale, image, dispatcherQueue, mode).ConfigureAwait(false);
                 _diskCache.UpdateAccessTime(key);
                 RecordCacheHit(uri, entry.SizeBytes, decodeWidth, decodeHeight, decodeType);
                 ForgetDownloadFailure(key);
@@ -491,7 +491,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         DecodePixelType decodeType,
         bool isSvg,
         double dpiScale,
-        out ImageSource? image)
+        out ImageSource? image, ImageRequestMode mode = ImageRequestMode.Cached)
     {
         image = null;
         if (isSvg || (decodeWidth <= 0 && decodeHeight <= 0))
@@ -499,7 +499,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             return false;
         }
 
-        var cacheKey = ComputeDecodedImageCacheKey(uri, decodeWidth, decodeHeight, decodeType, isSvg, dpiScale);
+        var cacheKey = ComputeDecodedImageCacheKey(uri, decodeWidth, decodeHeight, decodeType, isSvg, dpiScale, mode);
         lock (_smallDecodedImageCacheLock)
         {
             if (!_smallDecodedImageCache.TryGetValue(cacheKey, out var entry))
@@ -522,7 +522,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         bool isSvg,
         double dpiScale,
         ImageSource image,
-        DispatcherQueue? dispatcherQueue)
+        DispatcherQueue? dispatcherQueue, ImageRequestMode mode = ImageRequestMode.Cached)
     {
         if (isSvg)
         {
@@ -545,7 +545,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             return;
         }
 
-        var cacheKey = ComputeDecodedImageCacheKey(uri, decodeWidth, decodeHeight, decodeType, isSvg, dpiScale);
+        var cacheKey = ComputeDecodedImageCacheKey(uri, decodeWidth, decodeHeight, decodeType, isSvg, dpiScale, mode);
         lock (_smallDecodedImageCacheLock)
         {
             if (_smallDecodedImageCache.TryGetValue(cacheKey, out var existing))
@@ -605,10 +605,10 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         int decodeHeight,
         DecodePixelType decodeType,
         bool isSvg,
-        double dpiScale)
+        double dpiScale, ImageRequestMode mode)
     {
         var dpiBucket = (int)Math.Round(Math.Clamp(dpiScale, 0.5, 4.0) * 100);
-        return $"{ImageExDiskCache.ComputeCacheKey(uri, decodeWidth, decodeHeight, decodeType, isSvg)}:{dpiBucket}";
+        return $"{mode}:{ImageExDiskCache.ComputeCacheKey(uri, decodeWidth, decodeHeight, decodeType, isSvg)}:{dpiBucket}";
     }
 
     private static CacheResult CancelledResult(CancellationToken token, bool returnNullOnCancellation)

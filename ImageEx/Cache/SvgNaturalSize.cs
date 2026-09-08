@@ -17,7 +17,7 @@ internal static class SvgNaturalSize
         {
             using var reader = XmlReader.Create(stream, new XmlReaderSettings
             {
-                DtdProcessing = DtdProcessing.Prohibit,
+                DtdProcessing = DtdProcessing.Ignore,
                 XmlResolver = null,
                 CloseInput = false,
                 MaxCharactersInDocument = 65536

@@ -1,6 +1,5 @@
 #nullable enable
 
-using System.Buffers;
 using System.Diagnostics;
 using System.Net.Http;
 using Microsoft.UI.Dispatching;
@@ -35,7 +34,7 @@ internal sealed partial class ImageExCacheManager
             await sourceLock.Semaphore.WaitAsync(operationToken).ConfigureAwait(false);
             entered = true;
             var uriIsSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase);
-            if (TryGetSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, uriIsSvg, dpiScale, out var decoded))
+            if (TryGetSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, uriIsSvg, dpiScale, out var decoded, ImageRequestMode.Original))
             {
                 _diskCache.UpdateAccessTime(key);
                 RecordCacheHit(uri, 0, decodeWidth, decodeHeight, decodeType);
@@ -44,7 +43,7 @@ internal sealed partial class ImageExCacheManager
             if (_diskCache.TryGetEntry(key, out var entry) && entry != null)
             {
                 var cached = await TryLoadDiskEntryAsync(key, uri, entry, decodeWidth, decodeHeight,
-                    decodeType, dispatcherQueue, dpiScale, operationToken, returnNullOnCancellation: false).ConfigureAwait(false);
+                    decodeType, dispatcherQueue, dpiScale, operationToken, returnNullOnCancellation: false, mode: ImageRequestMode.Original).ConfigureAwait(false);
                 if (cached != null)
                 {
                     return new CacheResult(cached, true);
@@ -59,7 +58,7 @@ internal sealed partial class ImageExCacheManager
             await _downloadConcurrency.WaitAsync(operationToken).ConfigureAwait(false);
             try
             {
-                // Headers-only completion requires an explicit deadline for the body as well.
+                // Response headers and each body read have separate timeout budgets.
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(operationToken);
                 deadline.CancelAfter(TimeSpan.FromSeconds(30));
                 operationToken.ThrowIfCancellationRequested();
@@ -79,7 +78,8 @@ internal sealed partial class ImageExCacheManager
                 await using var source = await response.Content.ReadAsStreamAsync(deadline.Token).ConfigureAwait(false);
                 await using var file = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write,
                     FileShare.None, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                size = await CopyOriginalSourceAsync(source, file, sourceLimit, deadline.Token).ConfigureAwait(false);
+                deadline.CancelAfter(Timeout.InfiniteTimeSpan);
+                size = await CopyOriginalSourceAsync(source, file, sourceLimit, operationToken).ConfigureAwait(false);
                 if (size == 0) throw new IOException("Original image is empty.");
                 RecordDownloadCompleted(uri, checked((int)size));
             }
@@ -116,7 +116,7 @@ internal sealed partial class ImageExCacheManager
             });
             ForgetDownloadFailure(key);
             await StoreSmallDecodedImageAsync(uri, decodeWidth, decodeHeight, decodeType,
-                isSvg, dpiScale, image, dispatcherQueue).ConfigureAwait(false);
+                isSvg, dpiScale, image, dispatcherQueue, ImageRequestMode.Original).ConfigureAwait(false);
             await EnforceCleanupIfNeededAsync().ConfigureAwait(false);
             return new CacheResult(image, false);
         }
@@ -155,29 +155,6 @@ internal sealed partial class ImageExCacheManager
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
-        }
-    }
-
-    internal static async Task<long> CopyOriginalSourceAsync(Stream source, Stream destination, long maximumBytes, CancellationToken token)
-    {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumBytes);
-        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
-        long total = 0;
-        try
-        {
-            while (true)
-            {
-                var count = (int)Math.Min(buffer.Length, maximumBytes - total + 1);
-                var read = await source.ReadAsync(buffer.AsMemory(0, count), token).ConfigureAwait(false);
-                if (read == 0) return total;
-                total += read;
-                if (total > maximumBytes) throw new IOException("Original image exceeds source byte limit.");
-                await destination.WriteAsync(buffer.AsMemory(0, read), token).ConfigureAwait(false);
-            }
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 }

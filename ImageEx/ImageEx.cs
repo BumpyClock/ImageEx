@@ -32,15 +32,21 @@ namespace ImageEx
                 return new ImageLoadResult(null, false);
             }
 
-            var manager = CacheManagerOverride ?? ImageExCacheManager.Instance;
-            manager.MaxCacheDays = DiskCacheDays;
-            manager.MaxCacheSizeBytes = DiskCacheSizeMB * 1024L * 1024L;
+            var manager = EnableDiskCache ? CacheManagerOverride ?? ImageExCacheManager.Instance : null;
+            if (manager != null)
+            {
+                manager.MaxCacheDays = DiskCacheDays;
+                manager.MaxCacheSizeBytes = DiskCacheSizeMB * 1024L * 1024L;
+            }
             var dispatcher = ImageDispatcherQueue;
             var dpiScale = XamlRoot?.RasterizationScale ?? 1.0;
             foreach (var candidate in request.Candidates)
             {
                 token.ThrowIfCancellationRequested();
-                var result = candidate.Mode == ImageRequestMode.Original
+                var result = manager == null
+                    ? await ImageExCacheManager.GetUncachedImageAsync(candidate, DecodePixelWidth, DecodePixelHeight,
+                        DecodePixelType, token, dispatcher, dpiScale)
+                    : candidate.Mode == ImageRequestMode.Original
                     ? await manager.GetOrLoadOriginalImageAsync(candidate.Uri, DecodePixelWidth, DecodePixelHeight,
                         DecodePixelType, token, dispatcher, dpiScale, returnNullOnCancellation: true)
                     : await manager.GetOrLoadImageAsync(candidate.Uri, DecodePixelWidth, DecodePixelHeight,
