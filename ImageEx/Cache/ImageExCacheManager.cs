@@ -341,68 +341,15 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
         if (hasCacheEntry && entry != null)
         {
-            var filePath = _diskCache.GetFilePath(cacheKey, entry.Extension);
-            var age = DateTimeOffset.UtcNow - entry.DownloadedUtc;
-
-            if (age.TotalDays < MaxCacheDays && File.Exists(filePath))
+            var cached = await TryLoadDiskEntryAsync(cacheKey, uri, entry, decodeWidth, decodeHeight,
+                decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
+            if (cached != null)
             {
-                try
-                {
-                    if (token.IsCancellationRequested)
-                    {
-                        return CancelledResult(token, returnNullOnCancellation);
-                    }
-
-                    var cachedIsSvg = entry.Extension == ".svg";
-                    var image = await LoadFromFileAsync(filePath, cachedIsSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
-
-                    if (image != null)
-                    {
-                        await StoreSmallDecodedImageAsync(
-                            uri,
-                            decodeWidth,
-                            decodeHeight,
-                            decodeType,
-                            cachedIsSvg,
-                            dpiScale,
-                            image,
-                            dispatcherQueue).ConfigureAwait(false);
-                        _diskCache.UpdateAccessTime(cacheKey);
-
-                        RecordCacheHit(uri, entry.SizeBytes, decodeWidth, decodeHeight, decodeType);
-                        ForgetDownloadFailure(cacheKey);
-                        return new CacheResult(image, WasCacheHit: true);
-                    }
-                    else
-                    {
-                        if (token.IsCancellationRequested)
-                        {
-                            return CancelledResult(token, returnNullOnCancellation);
-                        }
-
-                        // Cached file failed to decode; remove and re-download.
-                        RemoveCacheEntryIfDeleted(cacheKey, filePath);
-                    }
-                }
-                catch (OperationCanceledException) when (!returnNullOnCancellation)
-                {
-                    throw;
-                }
-                catch (OperationCanceledException)
-                {
-                    return new CacheResult(null, false);
-                }
-                catch
-                {
-                    // The file is corrupt. Delete it and download the source again.
-                    RemoveCacheEntryIfDeleted(cacheKey, filePath);
-                }
+                return new CacheResult(cached, WasCacheHit: true);
             }
-            else
+            if (token.IsCancellationRequested)
             {
-                // The entry is expired. Remove it during cleanup.
-                var expiredPath = _diskCache.GetFilePath(cacheKey, entry.Extension);
-                RemoveCacheEntryIfDeleted(cacheKey, expiredPath);
+                return CancelledResult(token, returnNullOnCancellation);
             }
         }
 
@@ -470,6 +417,10 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 loadedImage,
                 dispatcherQueue).ConfigureAwait(false);
         }
+        else if (!token.IsCancellationRequested)
+        {
+            RememberDownloadFailure(cacheKey);
+        }
 
             return new CacheResult(loadedImage, WasCacheHit: false);
         }
@@ -477,6 +428,36 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         {
             EndOperation();
         }
+    }
+
+    private async Task<ImageSource?> TryLoadDiskEntryAsync(
+        string key, Uri uri, CacheEntry entry, int decodeWidth, int decodeHeight,
+        DecodePixelType decodeType, DispatcherQueue? dispatcherQueue, double dpiScale,
+        CancellationToken token, bool returnNullOnCancellation)
+    {
+        var path = _diskCache.GetFilePath(key, entry.Extension);
+        if ((DateTimeOffset.UtcNow - entry.DownloadedUtc).TotalDays < MaxCacheDays && File.Exists(path))
+        {
+            var isSvg = entry.Extension == ".svg";
+            var image = await LoadFromFileAsync(path, isSvg, decodeWidth, decodeHeight, decodeType,
+                dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
+            if (image != null)
+            {
+                await StoreSmallDecodedImageAsync(uri, decodeWidth, decodeHeight, decodeType,
+                    isSvg, dpiScale, image, dispatcherQueue).ConfigureAwait(false);
+                _diskCache.UpdateAccessTime(key);
+                RecordCacheHit(uri, entry.SizeBytes, decodeWidth, decodeHeight, decodeType);
+                ForgetDownloadFailure(key);
+                return image;
+            }
+            if (token.IsCancellationRequested)
+            {
+                return null;
+            }
+        }
+
+        RemoveCacheEntryIfDeleted(key, path);
+        return null;
     }
 
     private void BeginOperation()
@@ -549,7 +530,9 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         }
 
         var resolvedDimensions = await RunOnDispatcherAsync<int[]>(dispatcherQueue, () =>
-            image is BitmapSource { PixelWidth: > 0, PixelHeight: > 0 } bitmapSource
+            // Animation retains compressed bytes and frames outside the single-frame cache budget.
+            image is not BitmapImage { IsAnimatedBitmap: true }
+                && image is BitmapSource { PixelWidth: > 0, PixelHeight: > 0 } bitmapSource
                 ? new[] { bitmapSource.PixelWidth, bitmapSource.PixelHeight }
                 : null).ConfigureAwait(false);
         if (resolvedDimensions is null
@@ -894,7 +877,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         migratedEntry = null;
         var url = uri.OriginalString;
         var legacyEntries = _diskCache.GetAllEntries()
-            .Where(entry => entry.Key != sourceCacheKey && string.Equals(entry.Value.Url, url, StringComparison.Ordinal))
+            .Where(entry => entry.Key != sourceCacheKey && !entry.Key.StartsWith("original-", StringComparison.Ordinal)
+                && string.Equals(entry.Value.Url, url, StringComparison.Ordinal))
             .OrderByDescending(entry => entry.Value.LastAccessUtc)
             .ToList();
 
@@ -954,7 +938,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     {
         foreach (var legacyEntry in _diskCache.GetAllEntries())
         {
-            if (legacyEntry.Key == sourceCacheKey ||
+            if (legacyEntry.Key == sourceCacheKey || legacyEntry.Key.StartsWith("original-", StringComparison.Ordinal) ||
                 !string.Equals(legacyEntry.Value.Url, url, StringComparison.Ordinal))
             {
                 continue;
@@ -1251,8 +1235,9 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
         if (isSvg)
         {
+            var naturalSize = SvgNaturalSize.Read(stream);
             using var svgStream = stream.AsRandomAccessStream();
-            return await LoadSvgImageOnDispatcherAsync(svgStream, dispatcherQueue, token, returnNullOnCancellation).ConfigureAwait(false);
+            return await LoadSvgImageOnDispatcherAsync(svgStream, naturalSize, dispatcherQueue, token, returnNullOnCancellation).ConfigureAwait(false);
         }
 
         if (token.IsCancellationRequested)
@@ -1458,6 +1443,11 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             var expectedBytes = checked(dimensions.TargetWidth * dimensions.TargetHeight * 4);
             stage = "decoder-create";
             var decoder = await BitmapDecoder.CreateAsync(sourceStream).AsTask().ConfigureAwait(false);
+            if (decoder.DecoderInformation.CodecId == BitmapDecoder.GifDecoderId && decoder.FrameCount > 1)
+            {
+                return await CreateAnimatedBitmapAsync(sourceStream, dimensions, dispatcherQueue, token)
+                    .ConfigureAwait(false);
+            }
             var sourceWidth = decoder.PixelWidth;
             var sourceHeight = decoder.PixelHeight;
             var orientationSwapsAxes = sourceWidth > 0 &&
@@ -1533,6 +1523,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
     private static Task<ImageSource?> LoadSvgImageOnDispatcherAsync(
         IRandomAccessStream svgStream,
+        Size naturalSize,
         DispatcherQueue? dispatcherQueue,
         CancellationToken token,
         bool returnNullOnCancellation)
@@ -1550,7 +1541,24 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             }
 
             var svg = new SvgImageSource();
-            await svg.SetSourceAsync(svgStream);
+            try
+            {
+                var status = await svg.SetSourceAsync(svgStream);
+                if (status != SvgImageSourceLoadStatus.Success)
+                {
+                    return null;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception error)
+            {
+                Debug.WriteLine($"[ImageExCache] SVG decode failed: {error.Message}");
+                return null;
+            }
+            ImageExSourceMetadata.RegisterDecodedSource(svg, naturalSize);
             return svg;
         });
     }
@@ -1581,6 +1589,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             }
 
             bitmap.Invalidate();
+            ImageExSourceMetadata.RegisterDecodedSource(bitmap, new Size(dimensions.NaturalWidth, dimensions.NaturalHeight));
             return bitmap;
         });
     }
@@ -2017,6 +2026,9 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             _lastCleanup = now;
             var removed = 0;
             long freedBytes = 0;
+            RemoveAbandonedOriginalFiles(
+                Path.GetDirectoryName(_diskCache.GetFilePath("original-temp", ".tmp"))!,
+                now.UtcDateTime - TimeSpan.FromDays(1));
 
             // Scan the initial size when needed.
             if (!_initialSizeScanned)
@@ -2086,6 +2098,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             if (_disposeTask is null)
             {
                 _disposed = true;
+                _originalShutdown.Cancel();
                 var operationsDrained = _activeOperations == 0
                     ? Task.CompletedTask
                     : (_operationsDrained = new TaskCompletionSource(
@@ -2101,6 +2114,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private async Task DisposeCoreAsync(Task operationsDrained)
     {
         await operationsDrained.ConfigureAwait(false);
+        _originalShutdown.Dispose();
         var activeDownloads = _inFlightDownloads.Values
             .Where(download => download.IsValueCreated)
             .Select(download => download.Value.Task)

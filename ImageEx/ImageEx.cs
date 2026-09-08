@@ -25,6 +25,37 @@ namespace ImageEx
             DefaultStyleKey = typeof(ImageEx);
         }
 
+        protected override async Task<ImageLoadResult> ResolveImageRequestAsync(ImageRequest request, CancellationToken token)
+        {
+            if (ImageExDiagnostics.DisableHttpImages)
+            {
+                return new ImageLoadResult(null, false);
+            }
+
+            var manager = CacheManagerOverride ?? ImageExCacheManager.Instance;
+            manager.MaxCacheDays = DiskCacheDays;
+            manager.MaxCacheSizeBytes = DiskCacheSizeMB * 1024L * 1024L;
+            var dispatcher = ImageDispatcherQueue;
+            var dpiScale = XamlRoot?.RasterizationScale ?? 1.0;
+            foreach (var candidate in request.Candidates)
+            {
+                token.ThrowIfCancellationRequested();
+                var result = candidate.Mode == ImageRequestMode.Original
+                    ? await manager.GetOrLoadOriginalImageAsync(candidate.Uri, DecodePixelWidth, DecodePixelHeight,
+                        DecodePixelType, token, dispatcher, dpiScale, returnNullOnCancellation: true)
+                    : await manager.GetOrLoadImageAsync(candidate.Uri, DecodePixelWidth, DecodePixelHeight,
+                        DecodePixelType, token, dispatcher, dpiScale, returnNullOnCancellation: true);
+                token.ThrowIfCancellationRequested();
+                Debug.WriteLine($"[ImageExRoute] Host={candidate.Uri.Host} Mode={candidate.Mode} Success={result.Image != null} CacheHit={result.WasCacheHit}");
+                if (result.Image != null)
+                {
+                    return new ImageLoadResult(result.Image, result.WasCacheHit);
+                }
+            }
+
+            return new ImageLoadResult(null, false);
+        }
+
         /// <summary>
         /// Resolves an image and reports whether the memory or disk cache supplied it.
         /// </summary>

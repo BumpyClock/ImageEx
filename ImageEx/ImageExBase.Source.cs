@@ -252,7 +252,8 @@ namespace ImageEx
                     VisualStateManager.GoToState(this, UnloadedState, true);
                 }
             }
-            else if (IsLoaded && source is BitmapSource { PixelHeight: > 0, PixelWidth: > 0 })
+            else if (IsLoaded && (source is BitmapSource { PixelHeight: > 0, PixelWidth: > 0 } ||
+                ImageExSourceMetadata.IsDecoded(source)))
             {
                 UpdateDiagnosticAttachedSourceBytes();
                 VisualStateManager.GoToState(this, LoadedState, _shouldAnimateCurrentImage);
@@ -339,6 +340,25 @@ namespace ImageEx
                 requestToken = newToken;
 
                 VisualStateManager.GoToState(this, LoadingState, true);
+                if (source is ImageRequest imageRequest)
+                {
+                    var result = await ResolveImageRequestAsync(imageRequest, newToken);
+                    if (CanAttachResolvedSource(requestVersion, newTokenSource, newToken, result.Image))
+                    {
+                        if (result.Image == null)
+                        {
+                            VisualStateManager.GoToState(this, FailedState, true);
+                            ImageExFailed?.Invoke(this, new ImageExFailedEventArgs(new IOException("All image sources failed.")));
+                        }
+                        else
+                        {
+                            AttachSource(result.Image, shouldAnimateLoadedState: !result.IsCacheHit);
+                        }
+                    }
+
+                    return;
+                }
+
                 var imageSource = source as ImageSource;
                 if (imageSource != null)
                 {
@@ -507,6 +527,11 @@ namespace ImageEx
                 createOptions: BitmapCreateOptions.IgnoreImageCache);
         }
 
+        protected virtual Task<ImageLoadResult> ResolveImageRequestAsync(ImageRequest request, CancellationToken token)
+        {
+            throw new NotSupportedException("This control does not support ordered image requests.");
+        }
+
         /// <summary>
         /// Override this method to provide a custom image resolution strategy for <see cref="ImageExBase"/>.
         /// The default implementation uses the platform image cache.
@@ -516,6 +541,7 @@ namespace ImageEx
         /// <param name="imageUri">The image URI.</param>
         /// <param name="token">The token that signals an outdated request.</param>
         /// <returns>The resolved image and its cache status.</returns>
+
         protected virtual Task<ImageLoadResult> ResolveImageAsync(Uri imageUri, CancellationToken token)
         {
             // Use the platform image cache provided by the Image control.
