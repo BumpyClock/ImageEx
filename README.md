@@ -2,7 +2,7 @@
 
 The ImageEx control extends the platform Image control. It loads source images asynchronously and shows a loading indicator during the load. It saves downloaded images in the app's local cache so later loads use fewer resources and finish sooner.
 
-ImageEx accepts at most 8 MiB of source bytes for each raster or SVG response. It rejects larger declared responses before reading and stops chunked responses at the limit.
+Cached candidates accept at most 8 MiB of source bytes. Original raster candidates accept at most 32 MiB. SVG candidates retain the 8 MiB limit. Both routes reject oversized declared responses and stop chunked responses at the limit.
 
 Raster byte and file decodes use at most 2,097,152 physical pixels, or 8 MiB of BGRA data.
 Logical decode dimensions use the supplied DPI scale, clamped to 0.5 through 4.0, before the pixel limit applies.
@@ -23,3 +23,24 @@ Originally developed by Microsoft.Toolkit
 https://github.com/CommunityToolkit/WindowsCommunityToolkit
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL FOURSOFT BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Ordered image requests
+
+`ImageRequest` tries candidates in order until one succeeds. `ImageRequestMode` selects the source byte limit.
+Decoded memory entries remain separate for cached and original candidates, even with the same URI and decode dimensions.
+Original downloads allow 30 seconds for response headers and 30 seconds for each body read.
+A transfer can exceed 30 seconds if each read completes within its timeout.
+
+With `EnableDiskCache = false`, ordered requests retain candidate order and mode through a bounded memory download and decode path.
+This path does not create the disk cache manager or access cache files and metadata.
+HTTP or decode failures advance to the next candidate. Cancellation stops the request.
+
+SVG response media types use a case-insensitive comparison.
+SVG metadata accepts a `DOCTYPE` declaration without external resource resolution or DTD entity expansion.
+
+## Regression checks
+
+Run `dotnet run --project tests/ImageEx.Metadata.Tests/ImageEx.Metadata.Tests.csproj` for SVG metadata checks.
+Run `dotnet run --project tests/ImageEx.Transport.Tests/ImageEx.Transport.Tests.csproj` for bounded transport checks.
+These projects link production helpers. Transport checks use a decoder stub and do not validate WinUI playback or layout.
+Run `dotnet build ImageEx/ImageEx.csproj -p:Platform=x64` to compile the WinUI library.
