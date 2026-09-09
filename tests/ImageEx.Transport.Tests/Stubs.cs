@@ -19,7 +19,6 @@ namespace ImageEx.Cache
     internal sealed record DecodedImage(long Bytes, bool IsSvg);
     internal sealed partial class ImageExCacheManager
     {
-        internal const long MaximumOriginalSourceBytes = 32L * 1024 * 1024;
         internal sealed record CacheResult(DecodedImage? Image, bool WasCacheHit);
 
         // The test seam replaces WinUI decode only. Transport and bounds use production code.

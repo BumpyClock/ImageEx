@@ -3,16 +3,19 @@ using System.Net.Http.Headers;
 using ImageEx;
 using ImageEx.Cache;
 
+var cachedLimit = checked((int)ImageExCacheConstants.DefaultMaximumSourceBytes);
+var originalLimit = checked((int)ImageExCacheConstants.MaximumOriginalSourceBytes);
 var cases = new (string Name, ImageRequestMode Mode, int Length, bool Chunked, string MediaType, bool Success)[]
 {
     ("Cached success", ImageRequestMode.Cached, 1024, false, "image/png", true),
-    ("Cached declared limit", ImageRequestMode.Cached, 8 * 1024 * 1024 + 1, false, "image/png", false),
-    ("Cached chunked limit", ImageRequestMode.Cached, 8 * 1024 * 1024 + 1, true, "image/png", false),
-    ("Original accepts larger raster", ImageRequestMode.Original, 9 * 1024 * 1024, true, "image/png", true),
-    ("Original declared limit", ImageRequestMode.Original, 32 * 1024 * 1024 + 1, false, "image/png", false),
-    ("Original chunked limit", ImageRequestMode.Original, 32 * 1024 * 1024 + 1, true, "image/png", false),
-    ("Original SVG keeps smaller limit", ImageRequestMode.Original, 8 * 1024 * 1024 + 1, true, "image/svg+xml", false),
-    ("SVG content type", ImageRequestMode.Original, 1024, true, "image/svg+xml", true)
+    ("Cached declared limit", ImageRequestMode.Cached, cachedLimit + 1, false, "image/png", false),
+    ("Cached chunked limit", ImageRequestMode.Cached, cachedLimit + 1, true, "image/png", false),
+    ("Original accepts larger raster", ImageRequestMode.Original, cachedLimit + 1, true, "image/png", true),
+    ("Original declared limit", ImageRequestMode.Original, originalLimit + 1, false, "image/png", false),
+    ("Original chunked limit", ImageRequestMode.Original, originalLimit + 1, true, "image/png", false),
+    ("Original SVG keeps smaller limit", ImageRequestMode.Original, cachedLimit + 1, true, "image/svg+xml", false),
+    ("SVG content type", ImageRequestMode.Original, 1024, true, "image/svg+xml", true),
+    ("SVG mixed-case content type", ImageRequestMode.Original, 1024, true, "IMAGE/SVG+XML", true)
 };
 foreach (var test in cases)
 {
@@ -28,8 +31,20 @@ foreach (var test in cases)
     Assert((result.Image != null) == test.Success && !result.WasCacheHit, test.Name);
     if (test.Success)
     {
-        Assert(result.Image!.Bytes == test.Length && result.Image.IsSvg == (test.MediaType == "image/svg+xml"), test.Name + " decode input");
+        Assert(result.Image!.Bytes == test.Length && result.Image.IsSvg ==
+            string.Equals(test.MediaType, "image/svg+xml", StringComparison.OrdinalIgnoreCase), test.Name + " decode input");
     }
+}
+
+foreach (var (mode, limit) in new[] { (ImageRequestMode.Cached, cachedLimit), (ImageRequestMode.Original, originalLimit) })
+{
+    using var client = new HttpClient(new FakeHandler(_ =>
+    {
+        var content = new UnknownLengthContent(new byte[limit + 1]);
+        content.Headers.ContentLength = 1;
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+    }));
+    Assert((await Resolve(mode, client)).Image == null, $"{mode} rejects body larger than declared length and byte limit");
 }
 
 using (var client = new HttpClient(new FakeHandler(_ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)))))
@@ -55,7 +70,7 @@ using (var client = new HttpClient(new FakeHandler(async token =>
     }
 }
 await CopyTests.RunAsync();
-Console.WriteLine("Passed 10 uncached transport scenarios and 5 copy scenarios. WinUI decode is stubbed.");
+Console.WriteLine("Passed 13 uncached transport scenarios and 5 copy scenarios. WinUI decode is stubbed.");
 
 static Task<ImageExCacheManager.CacheResult> Resolve(ImageRequestMode mode, HttpClient client, CancellationToken token = default)
     => ImageExCacheManager.GetUncachedImageAsync(new(new Uri("https://test.invalid/source"), mode),

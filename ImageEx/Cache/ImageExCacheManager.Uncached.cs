@@ -26,14 +26,17 @@ internal sealed partial class ImageExCacheManager
             var isSvg = candidate.Uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(response.Content.Headers.ContentType?.MediaType, "image/svg+xml", StringComparison.OrdinalIgnoreCase);
             var maximumBytes = candidate.Mode == ImageRequestMode.Original && !isSvg
-                ? MaximumOriginalSourceBytes : ImageExCacheConstants.DefaultMaximumSourceBytes;
+                ? ImageExCacheConstants.MaximumOriginalSourceBytes : ImageExCacheConstants.DefaultMaximumSourceBytes;
             if (response.Content.Headers.ContentLength > maximumBytes)
             {
                 throw new IOException("Image exceeds source byte limit.");
             }
 
             using var source = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
-            using var bytes = new MemoryStream();
+            var declaredLength = response.Content.Headers.ContentLength;
+            using var bytes = new MemoryStream(declaredLength is > 0
+                ? checked((int)declaredLength.Value)
+                : 64 * 1024);
             await CopyOriginalSourceAsync(source, bytes, maximumBytes, token).ConfigureAwait(false);
             bytes.Position = 0;
             var image = await LoadFromStreamAsync(bytes, isSvg, decodeWidth, decodeHeight, decodeType,

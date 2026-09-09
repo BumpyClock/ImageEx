@@ -35,6 +35,7 @@ With `EnableDiskCache = false`, ordered requests retain candidate order and mode
 This path does not create the disk cache manager or access cache files and metadata.
 HTTP or decode failures advance to the next candidate. Cancellation stops the request.
 
+SVG response media types use a case-insensitive comparison.
 SVG metadata accepts a `DOCTYPE` declaration without external resource resolution or DTD entity expansion.
 
 ## Regression checks

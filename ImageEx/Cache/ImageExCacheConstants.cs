@@ -33,6 +33,11 @@ internal static class ImageExCacheConstants
     public const long DefaultMaximumSourceBytes = 8L * 1024 * 1024;
 
     /// <summary>
+    /// Maximum source response bytes accepted for one original raster download.
+    /// </summary>
+    public const long MaximumOriginalSourceBytes = 32L * 1024 * 1024;
+
+    /// <summary>
     /// During cleanup, reduce the cache to 80% of its maximum size.
     /// </summary>
     public const double CleanupTargetRatio = 0.8;

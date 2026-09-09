@@ -8,7 +8,8 @@ namespace ImageEx.Cache;
 
 internal sealed partial class ImageExCacheManager
 {
-    internal const long MaximumOriginalSourceBytes = 32L * 1024 * 1024;
+    // Preserve the diagnostics/test contract for dependent applications.
+    internal const long MaximumOriginalSourceBytes = ImageExCacheConstants.MaximumOriginalSourceBytes;
     private readonly CancellationTokenSource _originalShutdown = new();
 
     internal async Task<CacheResult> GetOrLoadOriginalImageAsync(
@@ -67,8 +68,8 @@ internal sealed partial class ImageExCacheManager
                     deadline.Token).ConfigureAwait(false);
                 response.EnsureSuccessStatusCode();
                 var contentType = response.Content.Headers.ContentType?.MediaType;
-                isSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase) || contentType == "image/svg+xml";
-                var sourceLimit = isSvg ? Math.Min(_maximumSourceBytes, MaximumOriginalSourceBytes) : MaximumOriginalSourceBytes;
+                isSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase) || string.Equals(contentType, "image/svg+xml", StringComparison.OrdinalIgnoreCase);
+                var sourceLimit = isSvg ? Math.Min(_maximumSourceBytes, ImageExCacheConstants.MaximumOriginalSourceBytes) : ImageExCacheConstants.MaximumOriginalSourceBytes;
                 if (response.Content.Headers.ContentLength > sourceLimit)
                     throw new IOException("Original image exceeds source byte limit.");
                 extension = ImageExDiskCache.GetExtension(uri, contentType, isSvg);
