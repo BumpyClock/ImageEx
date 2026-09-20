@@ -11,14 +11,16 @@ internal sealed partial class ImageExCacheManager
     // Preserve the diagnostics/test contract for dependent applications.
     internal const long MaximumOriginalSourceBytes = ImageExCacheConstants.MaximumOriginalSourceBytes;
     private readonly CancellationTokenSource _originalShutdown = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _visibleOriginalInterests = new();
 
     internal async Task<CacheResult> GetOrLoadOriginalImageAsync(
         Uri uri, int decodeWidth, int decodeHeight, DecodePixelType decodeType,
         CancellationToken token, DispatcherQueue? dispatcherQueue = null,
-        double dpiScale = 1.0, bool returnNullOnCancellation = false)
+        double dpiScale = 1.0, bool returnNullOnCancellation = false, bool metadataOnly = false)
     {
         BeginOperation();
         var key = "original-" + ImageExDiskCache.ComputeSourceCacheKey(uri);
+        if (!metadataOnly) _visibleOriginalInterests.AddOrUpdate(key, 1, static (_, count) => count + 1);
         CacheWriteLock? sourceLock = null;
         var entered = false;
         string? temporaryPath = null;
@@ -35,7 +37,7 @@ internal sealed partial class ImageExCacheManager
             await sourceLock.Semaphore.WaitAsync(operationToken).ConfigureAwait(false);
             entered = true;
             var uriIsSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase);
-            if (TryGetSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, uriIsSvg, dpiScale, out var decoded, ImageRequestMode.Original))
+            if (!metadataOnly && TryGetSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, uriIsSvg, dpiScale, out var decoded, ImageRequestMode.Original))
             {
                 _diskCache.UpdateAccessTime(key);
                 RecordCacheHit(uri, 0, decodeWidth, decodeHeight, decodeType);
@@ -43,11 +45,19 @@ internal sealed partial class ImageExCacheManager
             }
             if (_diskCache.TryGetEntry(key, out var entry) && entry != null)
             {
-                var cached = await TryLoadDiskEntryAsync(key, uri, entry, decodeWidth, decodeHeight,
-                    decodeType, dispatcherQueue, dpiScale, operationToken, returnNullOnCancellation: false, mode: ImageRequestMode.Original).ConfigureAwait(false);
-                if (cached != null)
+                if (metadataOnly)
                 {
-                    return new CacheResult(cached, true);
+                    var dimensions = await ReadCachedDimensionsAsync(key, entry, operationToken).ConfigureAwait(false);
+                    if (dimensions != null) return new CacheResult(null, true, dimensions);
+                }
+                else
+                {
+                    var cached = await TryLoadDiskEntryAsync(key, uri, entry, decodeWidth, decodeHeight,
+                        decodeType, dispatcherQueue, dpiScale, operationToken, returnNullOnCancellation: false, mode: ImageRequestMode.Original).ConfigureAwait(false);
+                    if (cached != null)
+                    {
+                        return new CacheResult(cached, true);
+                    }
                 }
             }
             if (IsRecentDownloadFailure(key)) return new CacheResult(null, false);
@@ -56,7 +66,8 @@ internal sealed partial class ImageExCacheManager
             string extension;
             bool isSvg;
             long size;
-            await _downloadConcurrency.WaitAsync(operationToken).ConfigureAwait(false);
+            await _downloadConcurrency.WaitAsync(operationToken,
+                () => _visibleOriginalInterests.TryGetValue(key, out var count) && count > 0).ConfigureAwait(false);
             try
             {
                 // Response headers and each body read have separate timeout budgets.
@@ -98,10 +109,14 @@ internal sealed partial class ImageExCacheManager
                 _downloadConcurrency.Release();
             }
 
-            var image = await LoadFromFileAsync(temporaryPath, isSvg, decodeWidth, decodeHeight, decodeType,
+            var metadata = metadataOnly
+                ? await ReadDimensionsAsync(new FileStream(temporaryPath, FileMode.Open, FileAccess.Read, FileShare.Read),
+                    isSvg, operationToken).ConfigureAwait(false)
+                : null;
+            var image = metadataOnly ? null : await LoadFromFileAsync(temporaryPath, isSvg, decodeWidth, decodeHeight, decodeType,
                 dispatcherQueue, dpiScale, operationToken).ConfigureAwait(false);
             operationToken.ThrowIfCancellationRequested();
-            if (image == null)
+            if (image == null && metadata == null)
             {
                 Debug.WriteLine($"[ImageEx] original-fallback failed host={uri.Host} reason=decode-null");
                 RememberDownloadFailure(key);
@@ -116,8 +131,15 @@ internal sealed partial class ImageExCacheManager
                 DownloadedUtc = DateTimeOffset.UtcNow, LastAccessUtc = DateTimeOffset.UtcNow
             });
             ForgetDownloadFailure(key);
+            if (metadata != null)
+            {
+                PersistDimensions(key, metadata);
+                await EnforceCleanupIfNeededAsync().ConfigureAwait(false);
+                return File.Exists(path) ? new CacheResult(null, false, metadata) : new CacheResult(null, false);
+            }
+            PersistImageDimensions(key, image!);
             await StoreSmallDecodedImageAsync(uri, decodeWidth, decodeHeight, decodeType,
-                isSvg, dpiScale, image, dispatcherQueue, ImageRequestMode.Original).ConfigureAwait(false);
+                isSvg, dpiScale, image!, dispatcherQueue, ImageRequestMode.Original).ConfigureAwait(false);
             await EnforceCleanupIfNeededAsync().ConfigureAwait(false);
             return new CacheResult(image, false);
         }
@@ -135,6 +157,20 @@ internal sealed partial class ImageExCacheManager
         }
         finally
         {
+            if (!metadataOnly)
+            {
+                // Keep increment/decrement atomic with entry removal so a newly arriving visible
+                // consumer cannot be removed by the previous consumer's completion.
+                while (_visibleOriginalInterests.TryGetValue(key, out var count))
+                {
+                    if (count == 1)
+                    {
+                        if (((ICollection<KeyValuePair<string, int>>)_visibleOriginalInterests)
+                            .Remove(new KeyValuePair<string, int>(key, count))) break;
+                    }
+                    else if (_visibleOriginalInterests.TryUpdate(key, count - 1, count)) break;
+                }
+            }
             if (temporaryPath != null) _diskCache.TryDeleteFile(temporaryPath);
             if (entered) sourceLock!.Semaphore.Release();
             if (sourceLock != null) ReleaseCacheWriteLock(key, sourceLock);

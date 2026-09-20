@@ -474,6 +474,11 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
 /// </summary>
 internal sealed record CacheEntry
 {
+    // Zero values preserve the unknown state of metadata written by older versions.
+    public double SourceWidth { get; init; }
+    public double SourceHeight { get; init; }
+    public bool DimensionsAreReduced { get; init; }
+
     /// <summary>
     /// Original URL of the cached image.
     /// </summary>

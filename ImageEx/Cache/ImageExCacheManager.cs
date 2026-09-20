@@ -42,8 +42,9 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private readonly Dictionary<string, CacheWriteLock> _cacheWriteLocks = new();
     private readonly object _cacheWriteLocksGate = new();
     private readonly SemaphoreSlim _cleanupLock = new(1, 1);
-    private readonly SemaphoreSlim _downloadConcurrency;
-    private readonly SemaphoreSlim _decodeConcurrency;
+    private readonly ImageAdmissionGate _downloadConcurrency;
+    private readonly ImageAdmissionGate _decodeConcurrency;
+    private readonly AsyncLocal<bool> _speculativeInterest = new();
     private readonly object _lifetimeGate = new();
     private readonly long _maximumSourceBytes;
     private DateTimeOffset _lastCleanup = DateTimeOffset.MinValue;
@@ -132,8 +133,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             : new HttpClient(httpMessageHandler) { Timeout = TimeSpan.FromSeconds(30) };
         maxConcurrentDownloads = Math.Max(1, maxConcurrentDownloads);
         maxConcurrentDecodes = Math.Max(1, maxConcurrentDecodes);
-        _downloadConcurrency = new SemaphoreSlim(maxConcurrentDownloads, maxConcurrentDownloads);
-        _decodeConcurrency = new SemaphoreSlim(maxConcurrentDecodes, maxConcurrentDecodes);
+        _downloadConcurrency = new ImageAdmissionGate(maxConcurrentDownloads);
+        _decodeConcurrency = new ImageAdmissionGate(maxConcurrentDecodes);
         _maximumSourceBytes = Math.Clamp(maximumSourceBytes, 1, int.MaxValue);
     }
 
@@ -142,7 +143,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     /// </summary>
     /// <param name="Image">The loaded ImageSource, or null on failure.</param>
     /// <param name="WasCacheHit">True when the memory or disk cache supplied the result.</param>
-    public record CacheResult(ImageSource? Image, bool WasCacheHit);
+    public record CacheResult(ImageSource? Image, bool WasCacheHit, ImageDimensions? Dimensions = null);
 
     internal readonly record struct ImageExCacheDiagnosticsSnapshot(
         bool IsInitialized,
@@ -176,16 +177,17 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         private readonly object _gate = new();
         private readonly CancellationTokenSource _cancellation = new();
         private int _waiterCount;
+        private int _visibleWaiterCount;
         private bool _cancelledForNoWaiters;
 
-        public SharedDownload(Func<CancellationToken, Task<DownloadResult>> startDownload)
+        public SharedDownload(Func<CancellationToken, Func<bool>, Task<DownloadResult>> startDownload)
         {
-            Task = startDownload(_cancellation.Token);
+            Task = startDownload(_cancellation.Token, () => Volatile.Read(ref _visibleWaiterCount) > 0);
         }
 
         public Task<DownloadResult> Task { get; }
 
-        public bool TryAddWaiter()
+        public bool TryAddWaiter(bool visible)
         {
             lock (_gate)
             {
@@ -195,15 +197,17 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 }
 
                 _waiterCount++;
+                if (visible) _visibleWaiterCount++;
                 return true;
             }
         }
 
-        public bool ReleaseWaiterShouldCancel()
+        public bool ReleaseWaiterShouldCancel(bool visible)
         {
             lock (_gate)
             {
                 _waiterCount--;
+                if (visible) _visibleWaiterCount--;
                 if (_waiterCount == 0 && !Task.IsCompleted)
                 {
                     _cancelledForNoWaiters = true;
@@ -301,7 +305,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         CancellationToken token,
         DispatcherQueue? dispatcherQueue = null,
         double dpiScale = 1.0,
-        bool returnNullOnCancellation = false)
+        bool returnNullOnCancellation = false,
+        bool metadataOnly = false)
     {
         BeginOperation();
         try
@@ -322,7 +327,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
         var isSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase);
         var cacheKey = ImageExDiskCache.ComputeSourceCacheKey(uri);
-        if (TryGetSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, isSvg, dpiScale, out var cachedSmallImage))
+        if (!metadataOnly && TryGetSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, isSvg, dpiScale, out var cachedSmallImage))
         {
             RecordCacheHit(uri, payloadBytes: 0, decodeWidth, decodeHeight, decodeType);
             return new CacheResult(cachedSmallImage, WasCacheHit: true);
@@ -341,11 +346,21 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
         if (hasCacheEntry && entry != null)
         {
-            var cached = await TryLoadDiskEntryAsync(cacheKey, uri, entry, decodeWidth, decodeHeight,
-                decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
-            if (cached != null)
+            if (metadataOnly)
             {
-                return new CacheResult(cached, WasCacheHit: true);
+                var metadata = await ReadCachedDimensionsAsync(cacheKey, entry, token).ConfigureAwait(false);
+                if (metadata != null) return new CacheResult(null, true, metadata);
+                token.ThrowIfCancellationRequested();
+                RemoveCacheEntryIfDeleted(cacheKey, _diskCache.GetFilePath(cacheKey, entry.Extension));
+            }
+            else
+            {
+                var cached = await TryLoadDiskEntryAsync(cacheKey, uri, entry, decodeWidth, decodeHeight,
+                    decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
+                if (cached != null)
+                {
+                    return new CacheResult(cached, WasCacheHit: true);
+                }
             }
             if (token.IsCancellationRequested)
             {
@@ -403,10 +418,23 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             // The disk save failed. Return the image from memory.
         }
 
+        if (metadataOnly)
+        {
+            token.ThrowIfCancellationRequested();
+            var dimensions = await ReadDimensionsAsync(new MemoryStream(result.Bytes.Buffer, 0,
+                result.Bytes.Length, writable: false), detectedSvg, token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            if (dimensions != null && PersistDimensions(cacheKey, dimensions))
+                return new CacheResult(null, false, dimensions);
+            if (dimensions == null) RememberDownloadFailure(cacheKey);
+            return new CacheResult(null, false);
+        }
+
         // Return an image from the downloaded bytes.
         var loadedImage = await LoadFromBytesAsync(result.Bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
         if (loadedImage != null)
         {
+            PersistImageDimensions(cacheKey, loadedImage);
             await StoreSmallDecodedImageAsync(
                 uri,
                 decodeWidth,
@@ -443,6 +471,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
             if (image != null)
             {
+                PersistImageDimensions(key, image);
                 await StoreSmallDecodedImageAsync(uri, decodeWidth, decodeHeight, decodeType,
                     isSvg, dpiScale, image, dispatcherQueue, mode).ConfigureAwait(false);
                 _diskCache.UpdateAccessTime(key);
@@ -633,7 +662,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             var lazyDownload = _inFlightDownloads.GetOrAdd(cacheKey, _ => CreateSharedDownloadLazy(cacheKey, uri));
             var sharedDownload = lazyDownload.Value;
 
-            if (!sharedDownload.TryAddWaiter())
+            var visible = !_speculativeInterest.Value;
+            if (!sharedDownload.TryAddWaiter(visible))
             {
                 RemoveSharedDownload(cacheKey, lazyDownload);
                 continue;
@@ -649,7 +679,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             }
             finally
             {
-                if (sharedDownload.ReleaseWaiterShouldCancel())
+                if (sharedDownload.ReleaseWaiterShouldCancel(visible))
                 {
                     RemoveSharedDownload(cacheKey, lazyDownload);
                     sharedDownload.Cancel();
@@ -728,7 +758,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
     private SharedDownload StartSharedDownload(string cacheKey, Uri uri, Lazy<SharedDownload>? lazyDownload)
     {
-        var sharedDownload = new SharedDownload(token => DownloadAsync(uri, token));
+        var sharedDownload = new SharedDownload((token, visible) => DownloadAsync(uri, token, visible));
         _ = sharedDownload.Task.ContinueWith(
             static (_, state) =>
             {
@@ -755,12 +785,12 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             .Remove(new KeyValuePair<string, Lazy<SharedDownload>>(cacheKey, lazyDownload));
     }
 
-    private async Task<DownloadResult> DownloadAsync(Uri uri, CancellationToken token)
+    private async Task<DownloadResult> DownloadAsync(Uri uri, CancellationToken token, Func<bool> visible)
     {
         const int maxAttempts = 3;
         const int baseDelayMs = 200;
 
-        await _downloadConcurrency.WaitAsync(token).ConfigureAwait(false);
+        await _downloadConcurrency.WaitAsync(token, visible).ConfigureAwait(false);
         try
         {
             RecordDownloadStarted(uri);
