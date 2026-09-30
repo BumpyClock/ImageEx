@@ -333,13 +333,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         await _diskCache.EnsureMetadataLoadedAsync().ConfigureAwait(false);
 
         // Try the local cache.
-        var hasCacheEntry = _diskCache.TryGetEntry(cacheKey, out var entry) && entry != null;
-        if (!hasCacheEntry)
-        {
-            hasCacheEntry = TryMigrateLegacyCacheEntry(cacheKey, uri, out entry);
-        }
-
-        if (hasCacheEntry && entry != null)
+        if (_diskCache.TryGetEntry(cacheKey, out var entry) && entry != null)
         {
             var cached = await TryLoadDiskEntryAsync(cacheKey, uri, entry, decodeWidth, decodeHeight,
                 decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
@@ -869,83 +863,6 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         finally
         {
             ArrayPool<byte>.Shared.Return(copyBuffer);
-        }
-    }
-
-    private bool TryMigrateLegacyCacheEntry(string sourceCacheKey, Uri uri, out CacheEntry? migratedEntry)
-    {
-        migratedEntry = null;
-        var url = uri.OriginalString;
-        var legacyEntries = _diskCache.GetAllEntries()
-            .Where(entry => entry.Key != sourceCacheKey && !entry.Key.StartsWith("original-", StringComparison.Ordinal)
-                && string.Equals(entry.Value.Url, url, StringComparison.Ordinal))
-            .OrderByDescending(entry => entry.Value.LastAccessUtc)
-            .ToList();
-
-        foreach (var legacyEntry in legacyEntries)
-        {
-            var legacyPath = _diskCache.GetFilePath(legacyEntry.Key, legacyEntry.Value.Extension);
-            if (!File.Exists(legacyPath))
-            {
-                _diskCache.RemoveEntry(legacyEntry.Key);
-                continue;
-            }
-
-            var sourcePath = _diskCache.GetFilePath(sourceCacheKey, legacyEntry.Value.Extension);
-            try
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(sourcePath)!);
-                if (!File.Exists(sourcePath))
-                {
-                    File.Copy(legacyPath, sourcePath, overwrite: false);
-                }
-
-                var sourceFileInfo = new FileInfo(sourcePath);
-                if (sourceFileInfo.Length == 0)
-                {
-                    RemoveCacheEntryIfDeleted(sourceCacheKey, sourcePath);
-                    RemoveCacheEntryIfDeleted(legacyEntry.Key, legacyPath);
-                    continue;
-                }
-
-                migratedEntry = new CacheEntry
-                {
-                    Url = legacyEntry.Value.Url,
-                    Extension = legacyEntry.Value.Extension,
-                    DownloadedUtc = legacyEntry.Value.DownloadedUtc,
-                    LastAccessUtc = DateTimeOffset.UtcNow,
-                    SizeBytes = sourceFileInfo.Length
-                };
-
-                _diskCache.AddOrUpdateEntry(sourceCacheKey, migratedEntry);
-                RemoveLegacyEntriesForUrl(sourceCacheKey, url);
-                return true;
-            }
-            catch (IOException)
-            {
-                // A concurrent decode or cleanup can touch old cache files. Let the download fill the source cache.
-            }
-            catch (UnauthorizedAccessException)
-            {
-                // Treat inaccessible legacy files as unusable for migration.
-            }
-        }
-
-        return false;
-    }
-
-    private void RemoveLegacyEntriesForUrl(string sourceCacheKey, string url)
-    {
-        foreach (var legacyEntry in _diskCache.GetAllEntries())
-        {
-            if (legacyEntry.Key == sourceCacheKey || legacyEntry.Key.StartsWith("original-", StringComparison.Ordinal) ||
-                !string.Equals(legacyEntry.Value.Url, url, StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            var legacyPath = _diskCache.GetFilePath(legacyEntry.Key, legacyEntry.Value.Extension);
-            RemoveCacheEntryIfDeleted(legacyEntry.Key, legacyPath);
         }
     }
 

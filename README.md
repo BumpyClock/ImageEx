@@ -31,6 +31,11 @@ Decoded memory entries remain separate for cached and original candidates, even 
 Original downloads allow 30 seconds for response headers and 30 seconds for each body read.
 A transfer can exceed 30 seconds if each read completes within its timeout.
 
+Current disk entries use one URI source key, with separate `original-` keys for original-mode bytes.
+Legacy decode-parameter entries are no longer scanned or migrated on source misses.
+A URL with only a legacy entry downloads again and cannot use that entry offline if the download fails.
+Legacy files and metadata remain until the existing age or size cleanup removes them.
+
 With `EnableDiskCache = false`, ordered requests retain candidate order and mode through a bounded memory download and decode path.
 This path does not create the disk cache manager or access cache files and metadata.
 HTTP or decode failures advance to the next candidate. Cancellation stops the request.
