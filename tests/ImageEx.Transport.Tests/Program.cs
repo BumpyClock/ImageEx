@@ -69,12 +69,52 @@ using (var client = new HttpClient(new FakeHandler(async token =>
         Console.WriteLine("PASS: active request cancellation");
     }
 }
-await CopyTests.RunAsync();
-Console.WriteLine("Passed 13 uncached transport scenarios and 5 copy scenarios. WinUI decode is stubbed.");
+// A guard token is the caller token. A missing idle deadline surfaces as guard cancellation instead of a hang.
+using (var guard = new CancellationTokenSource(IdleTimeoutTests.Guard))
+using (var client = new HttpClient(new FakeHandler(_ =>
+    Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StalledContent() }))))
+{
+    // More stalled loads than uncached slots. Queued loads start only after earlier ones release their slots.
+    var stalled = await Guarded(guard, () => Task.WhenAll(Enumerable.Range(0, 6)
+        .Select(_ => Resolve(ImageRequestMode.Cached, client, guard.Token, IdleTimeoutTests.Idle))));
+    Assert(stalled != null && stalled.All(result => result.Image == null), "Uncached stalled stream acquisitions terminate and release their slots");
+}
+using (var guard = new CancellationTokenSource(IdleTimeoutTests.Guard))
+using (var client = new HttpClient(new FakeHandler(_ =>
+    Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new StallStream(new byte[8], 3)) }))))
+{
+    var stalled = await Guarded(guard, () => Resolve(ImageRequestMode.Original, client, guard.Token, IdleTimeoutTests.Idle));
+    Assert(stalled is { Image: null }, "Uncached stalled body read terminates");
+}
+using (var guard = new CancellationTokenSource(IdleTimeoutTests.Guard))
+using (var client = new HttpClient(new FakeHandler(_ =>
+    Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(new byte[1024]) }))))
+{
+    var loaded = await Guarded(guard, () => Resolve(ImageRequestMode.Cached, client, guard.Token, IdleTimeoutTests.Idle));
+    Assert(loaded?.Image?.Bytes == 1024, "Uncached load succeeds after stalled loads terminate");
+}
 
-static Task<ImageExCacheManager.CacheResult> Resolve(ImageRequestMode mode, HttpClient client, CancellationToken token = default)
+await CopyTests.RunAsync();
+var idleScenarios = await IdleTimeoutTests.RunAsync();
+Console.WriteLine($"Passed 16 uncached transport scenarios, 5 copy scenarios, and {idleScenarios} idle timeout scenarios. WinUI decode is stubbed.");
+
+static Task<ImageExCacheManager.CacheResult> Resolve(ImageRequestMode mode, HttpClient client, CancellationToken token = default,
+    TimeSpan? bodyIdleTimeout = null)
     => ImageExCacheManager.GetUncachedImageAsync(new(new Uri("https://test.invalid/source"), mode),
-        64, 64, DecodePixelType.Physical, token, httpClient: client);
+        64, 64, DecodePixelType.Physical, token, httpClient: client, bodyIdleTimeout: bodyIdleTimeout);
+
+static async Task<T?> Guarded<T>(CancellationTokenSource guard, Func<Task<T>> body) where T : class
+{
+    try
+    {
+        return await body();
+    }
+    catch (OperationCanceledException error) when (error.CancellationToken == guard.Token)
+    {
+        Console.WriteLine("Guard expired before the idle deadline settled the load.");
+        return null;
+    }
+}
 
 static void Assert(bool value, string name)
 {

@@ -80,7 +80,7 @@ internal sealed partial class ImageExCacheManager
                 await using var file = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write,
                     FileShare.None, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
                 deadline.CancelAfter(Timeout.InfiniteTimeSpan);
-                size = await CopyOriginalSourceAsync(source, file, sourceLimit, operationToken).ConfigureAwait(false);
+                size = await CopyOriginalSourceAsync(source, file, sourceLimit, operationToken, _bodyIdleTimeout).ConfigureAwait(false);
                 if (size == 0) throw new IOException("Original image is empty.");
                 RecordDownloadCompleted(uri, checked((int)size));
             }

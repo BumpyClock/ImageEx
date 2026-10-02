@@ -4,21 +4,22 @@ internal static class CopyTests
 {
     internal static async Task RunAsync()
     {
-        using (var source = new DelayedStream(12, TimeSpan.FromMilliseconds(100)))
+        var payload = IdleTimeoutTests.Pattern(12);
+        using (var source = new DelayedStream(payload, TimeSpan.FromMilliseconds(100)))
         using (var destination = new MemoryStream())
         {
             var count = await ImageExCacheManager.CopyOriginalSourceAsync(source, destination, 12,
                 CancellationToken.None, TimeSpan.FromMilliseconds(500));
-            if (count != 12 || destination.Length != 12) throw new Exception("FAIL: progress copy.");
+            if (count != 12 || !destination.ToArray().AsSpan().SequenceEqual(payload)) throw new Exception("FAIL: progress copy.");
             Console.WriteLine("PASS: progress exceeds one idle budget and exact limit succeeds");
         }
-        await ExpectFailure<OperationCanceledException>(new DelayedStream(1, Timeout.InfiniteTimeSpan),
+        await ExpectFailure<OperationCanceledException>(new DelayedStream(new byte[1], Timeout.InfiniteTimeSpan),
             1, CancellationToken.None, TimeSpan.FromMilliseconds(50), "stalled read expires");
         await ExpectFailure<IOException>(new MemoryStream(new byte[13]),
             12, CancellationToken.None, TimeSpan.FromSeconds(1), "source byte limit");
         using (var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(50)))
         {
-            await ExpectFailure<OperationCanceledException>(new DelayedStream(1, Timeout.InfiniteTimeSpan),
+            await ExpectFailure<OperationCanceledException>(new DelayedStream(new byte[1], Timeout.InfiniteTimeSpan),
                 1, cancellation.Token, TimeSpan.FromSeconds(5), "caller cancellation interrupts read");
         }
         using (var source = new MemoryStream())
@@ -48,14 +49,5 @@ internal static class CopyTests
             }
         }
         throw new Exception("FAIL: " + name);
-    }
-
-    private sealed class DelayedStream(int length, TimeSpan delay) : MemoryStream(new byte[length])
-    {
-        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-        {
-            await Task.Delay(delay, cancellationToken);
-            return await base.ReadAsync(buffer[..Math.Min(1, buffer.Length)], cancellationToken);
-        }
     }
 }

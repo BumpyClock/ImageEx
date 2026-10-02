@@ -1,6 +1,7 @@
 #nullable enable
 
 using System.Buffers;
+using System.Net.Http;
 
 namespace ImageEx.Cache;
 
@@ -9,8 +10,7 @@ internal sealed partial class ImageExCacheManager
     internal static async Task<long> CopyOriginalSourceAsync(Stream source, Stream destination, long maximumBytes, CancellationToken token, TimeSpan? idleTimeout = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumBytes);
-        using var idle = CancellationTokenSource.CreateLinkedTokenSource(token);
-        var timeout = idleTimeout ?? TimeSpan.FromSeconds(30);
+        var timeout = idleTimeout ?? ImageExCacheConstants.SourceIdleTimeout;
         var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
         long total = 0;
         try
@@ -18,9 +18,7 @@ internal sealed partial class ImageExCacheManager
             while (true)
             {
                 var count = (int)Math.Min(buffer.Length, maximumBytes - total + 1);
-                idle.CancelAfter(timeout);
-                var read = await source.ReadAsync(buffer.AsMemory(0, count), idle.Token).ConfigureAwait(false);
-                idle.CancelAfter(Timeout.InfiniteTimeSpan);
+                var read = await ReadSourceAsync(source, buffer.AsMemory(0, count), timeout, token).ConfigureAwait(false);
                 if (read == 0) return total;
                 total += read;
                 if (total > maximumBytes) throw new IOException("Original image exceeds source byte limit.");
@@ -32,4 +30,63 @@ internal sealed partial class ImageExCacheManager
             ArrayPool<byte>.Shared.Return(buffer);
         }
     }
+
+    // Each body operation gets a fresh deadline, so an expired deadline never reaches the next read.
+    // Upstream cancellation wins and carries the upstream token.
+    // Idle expiry is a TaskCanceledException that does not carry the upstream token, so the cached retry filter treats it as a timeout.
+    internal static async Task<Stream> OpenSourceStreamAsync(HttpContent content, TimeSpan idleTimeout, CancellationToken token)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(idleTimeout, TimeSpan.Zero);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(idleTimeout);
+        Stream stream;
+        try
+        {
+            stream = await content.ReadAsStreamAsync(deadline.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException error) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
+        {
+            throw IdleTimeoutExpired(error, deadline.Token);
+        }
+        catch (OperationCanceledException error) when (token.IsCancellationRequested && error.CancellationToken != token)
+        {
+            throw new OperationCanceledException(error.Message, error, token);
+        }
+
+        if (token.IsCancellationRequested)
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+        }
+
+        return stream;
+    }
+
+    // The read is always awaited, so a pooled buffer never returns to the pool while a read still owns it.
+    internal static async Task<int> ReadSourceAsync(Stream source, Memory<byte> buffer, TimeSpan idleTimeout, CancellationToken token)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(idleTimeout, TimeSpan.Zero);
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(token);
+        deadline.CancelAfter(idleTimeout);
+        int read;
+        try
+        {
+            read = await source.ReadAsync(buffer, deadline.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException error) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
+        {
+            throw IdleTimeoutExpired(error, deadline.Token);
+        }
+        catch (OperationCanceledException error) when (token.IsCancellationRequested && error.CancellationToken != token)
+        {
+            throw new OperationCanceledException(error.Message, error, token);
+        }
+
+        token.ThrowIfCancellationRequested();
+        return read;
+    }
+
+    private static TaskCanceledException IdleTimeoutExpired(OperationCanceledException error, CancellationToken deadline)
+        => new("Image source body made no progress within the idle timeout.",
+            new TimeoutException("Image source body idle timeout elapsed.", error), deadline);
 }

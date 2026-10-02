@@ -38,6 +38,12 @@ internal static class ImageExCacheConstants
     public const long MaximumOriginalSourceBytes = 32L * 1024 * 1024;
 
     /// <summary>
+    /// Maximum wait for one image body stream acquisition or one pending body read.
+    /// It does not limit the total transfer duration.
+    /// </summary>
+    public static readonly TimeSpan SourceIdleTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// During cleanup, reduce the cache to 80% of its maximum size.
     /// </summary>
     public const double CleanupTargetRatio = 0.8;
