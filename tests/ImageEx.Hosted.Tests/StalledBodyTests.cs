@@ -62,27 +62,51 @@ public sealed class StalledBodyTests
     {
         var stalledA = TestUris.Next("stalled-a.png");
         var stalledB = TestUris.Next("stalled-b.png");
-        var thumbnail = TestUris.Next("thumbnail.png");
+        var thumbnailA = TestUris.Next("thumbnail-a.png");
+        var thumbnailB = TestUris.Next("thumbnail-b.png");
         var original = TestUris.Next("original.png");
         var png = await Png(Bgra.Red);
         var handler = new FixtureHandler()
             .ServeScripted(stalledA, png, BodyScript.StallAfter(0))
             .ServeScripted(stalledB, png, BodyScript.StallAcquisition())
-            .Serve(thumbnail, await Png(Bgra.Green))
             .Serve(original, await Png(Bgra.Blue));
+
+        // A gated request holds its download slot while it waits for headers. The header timeout is 30 seconds.
+        var gates = new[] { handler.ServeGated(thumbnailA, await Png(Bgra.Green)), handler.ServeGated(thumbnailB, await Png(Bgra.Gray)) };
         await using var scope = new ManagerScope(handler, Idle);
+        try
+        {
+            var stalled = new[] { scope.Manager.GetOrLoadImageAsync(stalledA, Size, Size, DecodePixelType.Physical, CancellationToken.None, scope.Dispatcher),
+                scope.Manager.GetOrLoadImageAsync(stalledB, Size, Size, DecodePixelType.Physical, CancellationToken.None, scope.Dispatcher) };
+            await TestWait.ForTaskAsync(Task.WhenAll(stalled), "both stalled downloads to terminate");
+            Assert.IsNull((await stalled[0]).Image);
+            Assert.IsNull((await stalled[1]).Image);
 
-        var stalled = new[] { scope.Manager.GetOrLoadImageAsync(stalledA, Size, Size, DecodePixelType.Physical, CancellationToken.None, scope.Dispatcher),
-            scope.Manager.GetOrLoadImageAsync(stalledB, Size, Size, DecodePixelType.Physical, CancellationToken.None, scope.Dispatcher) };
-        await TestWait.ForTaskAsync(Task.WhenAll(stalled), "both stalled downloads to terminate");
-        Assert.IsNull((await stalled[0]).Image);
-        Assert.IsNull((await stalled[1]).Image);
+            // Both later loads must hold a slot at the same time. A single leaked slot keeps the second gate unreached.
+            var loads = new[] { scope.Manager.GetOrLoadImageAsync(thumbnailA, Size, Size, DecodePixelType.Physical, CancellationToken.None, scope.Dispatcher),
+                scope.Manager.GetOrLoadImageAsync(thumbnailB, Size, Size, DecodePixelType.Physical, CancellationToken.None, scope.Dispatcher) };
+            await gates[0].WaitUntilStartedAsync();
+            await gates[1].WaitUntilStartedAsync();
+            foreach (var gate in gates)
+            {
+                gate.Release();
+            }
 
-        var loaded = await scope.LoadAsync(thumbnail);
-        ImageFixtures.AssertColor(ImageFixtures.AssertRaster(loaded.Image, Size, Size, "thumbnail"), Bgra.Green, "thumbnail");
-        var pending = scope.Manager.GetOrLoadOriginalImageAsync(original, Size, Size, DecodePixelType.Physical, CancellationToken.None, scope.Dispatcher);
-        await TestWait.ForTaskAsync(pending, "the original load after the stalls");
-        ImageFixtures.AssertColor(ImageFixtures.AssertRaster((await pending).Image, Size, Size, "original"), Bgra.Blue, "original");
+            await TestWait.ForTaskAsync(Task.WhenAll(loads), "both concurrent thumbnail loads to settle");
+            ImageFixtures.AssertColor(ImageFixtures.AssertRaster((await loads[0]).Image, Size, Size, "thumbnail A"), Bgra.Green, "thumbnail A");
+            ImageFixtures.AssertColor(ImageFixtures.AssertRaster((await loads[1]).Image, Size, Size, "thumbnail B"), Bgra.Gray, "thumbnail B");
+
+            var pending = scope.Manager.GetOrLoadOriginalImageAsync(original, Size, Size, DecodePixelType.Physical, CancellationToken.None, scope.Dispatcher);
+            await TestWait.ForTaskAsync(pending, "the original load after the stalls");
+            ImageFixtures.AssertColor(ImageFixtures.AssertRaster((await pending).Image, Size, Size, "original"), Bgra.Blue, "original");
+        }
+        finally
+        {
+            foreach (var gate in gates)
+            {
+                gate.Release();
+            }
+        }
     }
 
     // Criterion 3: an ordered request displays a later candidate after a stalled candidate exhausts retries.
@@ -260,19 +284,24 @@ public sealed class StalledBodyTests
     }
 
     // Criterion 8: an original body that ends early leaves no partial temporary file.
+    // Each stalled script observes the temporary file from inside its pending read. Production cannot settle
+    // that read, or delete the file, while the observation runs, so the precondition does not race cleanup.
+    // The prefix exceeds the 64 KiB file buffer, so at least one write has reached the disk.
     [UITestMethod]
     public async Task Original_cancellation_during_the_body_leaves_no_temporary_file()
     {
         var uri = TestUris.Next("canceled-original.png");
-        var stall = BodyScript.StallAfter(32);
-        var handler = new FixtureHandler().ServeScripted(uri, await Png(Bgra.Green), stall, BodyScript.Complete());
+        var observation = new PrefixObservation();
+        var stall = BodyScript.StallAfter(OriginalPrefixBytes, onStall: observation.Capture);
+        var handler = new FixtureHandler().ServeScripted(uri, await OriginalPng(Bgra.Green), stall, BodyScript.Complete());
         await using var scope = new ManagerScope(handler, bodyIdleTimeout: null);
+        observation.Directory = scope.CacheDirectory;
 
         using (var cancellation = new CancellationTokenSource())
         {
             var pending = scope.Manager.GetOrLoadOriginalImageAsync(uri, Size, Size, DecodePixelType.Physical, cancellation.Token, scope.Dispatcher);
             await stall.WaitUntilStalledAsync();
-            Assert.IsTrue(scope.TemporaryOriginalFiles().Any(), "The stalled original wrote no temporary file.");
+            observation.AssertPrefixWritten();
             cancellation.Cancel();
             await TestWait.ForTaskAsync(pending, "the canceled original to settle");
             await Assert.ThrowsAsync<OperationCanceledException>(() => pending);
@@ -287,13 +316,15 @@ public sealed class StalledBodyTests
     public async Task Original_shutdown_during_the_body_leaves_no_temporary_file()
     {
         var uri = TestUris.Next("shutdown-original.png");
-        var stall = BodyScript.StallAfter(32);
-        var handler = new FixtureHandler().ServeScripted(uri, await Png(Bgra.Green), stall);
+        var observation = new PrefixObservation();
+        var stall = BodyScript.StallAfter(OriginalPrefixBytes, onStall: observation.Capture);
+        var handler = new FixtureHandler().ServeScripted(uri, await OriginalPng(Bgra.Green), stall);
         await using var scope = new ManagerScope(handler, bodyIdleTimeout: null);
+        observation.Directory = scope.CacheDirectory;
 
         var pending = scope.Manager.GetOrLoadOriginalImageAsync(uri, Size, Size, DecodePixelType.Physical, CancellationToken.None, scope.Dispatcher);
         await stall.WaitUntilStalledAsync();
-        Assert.IsTrue(scope.TemporaryOriginalFiles().Any(), "The stalled original wrote no temporary file.");
+        observation.AssertPrefixWritten();
 
         await TestWait.ForTaskAsync(scope.Manager.DisposeAsync().AsTask(), "manager disposal during an original body");
         await TestWait.ForTaskAsync(pending, "the original to settle after shutdown");
@@ -306,17 +337,18 @@ public sealed class StalledBodyTests
     {
         var uri = TestUris.Next("expired-original.png");
         var next = TestUris.Next("next-original.png");
-        var stall = BodyScript.StallAfter(32);
+        var observation = new PrefixObservation();
+        var stall = BodyScript.StallAfter(OriginalPrefixBytes, onStall: observation.Capture);
         var handler = new FixtureHandler()
-            .ServeScripted(uri, await Png(Bgra.Green), stall)
+            .ServeScripted(uri, await OriginalPng(Bgra.Green), stall)
             .Serve(next, await Png(Bgra.Red));
         await using var scope = new ManagerScope(handler, Idle);
+        observation.Directory = scope.CacheDirectory;
 
         var pending = scope.Manager.GetOrLoadOriginalImageAsync(uri, Size, Size, DecodePixelType.Physical, CancellationToken.None, scope.Dispatcher);
-        await stall.WaitUntilStalledAsync();
-        Assert.IsTrue(scope.TemporaryOriginalFiles().Any(), "The stalled original wrote no temporary file.");
         await TestWait.ForTaskAsync(pending, "the stalled original to expire");
         Assert.IsNull((await pending).Image);
+        observation.AssertPrefixWritten();
         Assert.IsFalse(scope.TemporaryOriginalFiles().Any(), "Idle expiry left a temporary original file.");
 
         var loaded = await scope.LoadOriginalAsync(next);
@@ -344,6 +376,32 @@ public sealed class StalledBodyTests
     }
 
     private static Task<byte[]> Png(Bgra color) => ImageFixtures.PngAsync(Size, Size, color);
+
+    private const int OriginalPrefixBytes = 96 * 1024;
+
+    private static Task<byte[]> OriginalPng(Bgra color) => ImageFixtures.PaddedPngAsync(Size, Size, color, 128 * 1024);
+
+    /// <summary>
+    /// Records the temporary original files and their on-disk lengths from inside the pending stalled read.
+    /// </summary>
+    private sealed class PrefixObservation
+    {
+        private long[]? _lengths;
+
+        public string? Directory { get; set; }
+
+        public void Capture()
+            => _lengths = System.IO.Directory.EnumerateFiles(Directory!, "original-*.tmp", SearchOption.AllDirectories)
+                .Select(path => new FileInfo(path).Length)
+                .ToArray();
+
+        public void AssertPrefixWritten()
+        {
+            Assert.IsNotNull(_lengths, "The original body never reached its stall.");
+            Assert.AreEqual(1, _lengths.Length, "Expected one temporary original file while the body was stalled.");
+            Assert.IsTrue(_lengths[0] > 0, "The temporary original file held no written prefix while the body was stalled.");
+        }
+    }
 
     private static async Task AssertStallFailsThenBacksOffAsync(Func<BodyScript> stall)
     {
@@ -399,7 +457,11 @@ public sealed class StalledBodyTests
         public async ValueTask DisposeAsync()
         {
             BodyScript.AbortAll();
-            await Manager.DisposeAsync();
+
+            // Disposal does not cancel a cached download that waits for a download slot, so a leaked slot
+            // would keep disposal pending. The guard fails the test instead of hanging the lane.
+            var disposal = Manager.DisposeAsync().AsTask();
+            await TestWait.ForTaskAsync(disposal, "the manager to dispose");
             _directory.Dispose();
         }
     }

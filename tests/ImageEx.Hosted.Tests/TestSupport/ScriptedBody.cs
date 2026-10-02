@@ -30,6 +30,8 @@ internal sealed class BodyScript
 
     public bool IsGated { get; private init; }
 
+    public Action? OnStall { get; private init; }
+
     public TimeSpan ReadDelay { get; private init; }
 
     public int ChunkBytes { get; private init; } = int.MaxValue;
@@ -41,8 +43,9 @@ internal sealed class BodyScript
 
     public static BodyScript StallAcquisition() => new() { StallsAcquisition = true };
 
-    public static BodyScript StallAfter(int bytes, bool reportIOException = false)
-        => new() { StallAfterBytes = bytes, ReportsIOException = reportIOException };
+    /// <param name="onStall">Runs inside the pending stalled read, before it waits. The operation cannot settle while it runs.</param>
+    public static BodyScript StallAfter(int bytes, bool reportIOException = false, Action? onStall = null)
+        => new() { StallAfterBytes = bytes, ReportsIOException = reportIOException, OnStall = onStall };
 
     public static BodyScript Progressing(TimeSpan readDelay, int chunkBytes) => new() { ReadDelay = readDelay, ChunkBytes = chunkBytes };
 
@@ -65,6 +68,7 @@ internal sealed class BodyScript
 
     internal async Task StallAsync(CancellationToken token)
     {
+        OnStall?.Invoke();
         _stalled.TrySetResult();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(token, _abort.Token);
         try

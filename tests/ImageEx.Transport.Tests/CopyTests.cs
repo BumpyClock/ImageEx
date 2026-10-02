@@ -13,8 +13,13 @@ internal static class CopyTests
             if (count != 12 || !destination.ToArray().AsSpan().SequenceEqual(payload)) throw new Exception("FAIL: progress copy.");
             Console.WriteLine("PASS: progress exceeds one idle budget and exact limit succeeds");
         }
-        await ExpectFailure<OperationCanceledException>(new DelayedStream(new byte[1], Timeout.InfiniteTimeSpan),
-            1, CancellationToken.None, TimeSpan.FromMilliseconds(50), "stalled read expires");
+        // The guard token only bounds the case. Idle expiry must settle the read, not the guard.
+        using (var guard = new CancellationTokenSource(IdleTimeoutTests.Guard))
+        {
+            await ExpectFailure<OperationCanceledException>(new DelayedStream(new byte[1], Timeout.InfiniteTimeSpan),
+                1, guard.Token, TimeSpan.FromMilliseconds(50), "stalled read expires",
+                error => error.CancellationToken != guard.Token);
+        }
         await ExpectFailure<IOException>(new MemoryStream(new byte[13]),
             12, CancellationToken.None, TimeSpan.FromSeconds(1), "source byte limit");
         using (var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(50)))
@@ -32,7 +37,7 @@ internal static class CopyTests
     }
 
     private static async Task ExpectFailure<T>(Stream source, long limit, CancellationToken token,
-        TimeSpan timeout, string name) where T : Exception
+        TimeSpan timeout, string name, Func<T, bool>? accept = null) where T : Exception
     {
         using (source)
         using (var destination = new MemoryStream())
@@ -41,7 +46,7 @@ internal static class CopyTests
             {
                 await ImageExCacheManager.CopyOriginalSourceAsync(source, destination, limit, token, timeout);
             }
-            catch (T)
+            catch (T error) when (accept == null || accept(error))
             {
                 if (destination.Length > limit) throw new Exception("FAIL: oversized output.");
                 Console.WriteLine("PASS: " + name);
