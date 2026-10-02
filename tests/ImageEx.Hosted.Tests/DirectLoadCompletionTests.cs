@@ -166,13 +166,13 @@ public sealed class DirectLoadCompletionTests
             late.Release();
             await harness.SettleAsync();
 
-            Assert.AreEqual(0, harness.FailedCount);
-            Assert.AreEqual(openedBeforeRelease, harness.OpenedCount, "The late completion opened an image.");
-            Assert.AreEqual("Loaded", harness.CurrentState);
             Assert.AreSame(displayed, harness.DisplayedSource, "The late completion replaced the displayed image.");
             ImageFixtures.AssertColor(ImageFixtures.AssertRaster(harness.DisplayedSource, 40, 80, "replacement"), Bgra.Blue, "replacement");
             Assert.IsTrue(harness.TryGetNaturalSize(out var size));
             Assert.AreEqual(new Size(40, 80), size, "The late completion changed the natural size.");
+            Assert.AreEqual(0, harness.FailedCount);
+            Assert.AreEqual(openedBeforeRelease, harness.OpenedCount, "The late completion opened an image.");
+            Assert.AreEqual("Loaded", harness.CurrentState);
         }
         finally
         {
@@ -217,15 +217,14 @@ public sealed class DirectLoadCompletionTests
             late.Release();
             await harness.SettleAsync();
 
+            Assert.IsNull(harness.DisplayedSource, "The late completion attached its image.");
+            Assert.IsFalse(harness.TryGetNaturalSize(out var size), $"The late completion reported natural size {size}.");
             Assert.AreEqual(0, harness.FailedCount, "ImageExFailed count.");
             Assert.AreEqual(0, harness.OpenedCount, "The late completion opened an image.");
             if (expectedState != null)
             {
                 Assert.AreEqual(expectedState, harness.CurrentState);
             }
-
-            Assert.IsNull(harness.DisplayedSource, "The late completion attached its image.");
-            Assert.IsFalse(harness.TryGetNaturalSize(out var size), $"The late completion reported natural size {size}.");
         }
         finally
         {
