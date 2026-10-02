@@ -197,14 +197,14 @@ if (-not $vswherePath) {
     throw 'vswhere.exe was not found. Install Visual Studio with packaged test support.'
 }
 
-$installationPaths = @(& $vswherePath -latest -products * -property installationPath | Where-Object { $_ })
-if ($installationPaths.Count -ne 1) {
-    throw "Expected one latest Visual Studio installation from vswhere, found $($installationPaths.Count)."
-}
-
-$vstestPath = Join-Path $installationPaths[0] 'Common7\IDE\CommonExtensions\Microsoft\TestWindow\vstest.console.exe'
-if (-not [System.IO.File]::Exists($vstestPath)) {
-    throw "Visual Studio vstest.console.exe not found: $vstestPath"
+# The newest product can be Build Tools, which has no vstest.console.exe. Take the newest installation that has it.
+$installationPaths = @(& $vswherePath -all -sort -products * -property installationPath | Where-Object { $_ })
+$vstestPath = $installationPaths |
+    ForEach-Object { Join-Path $_ 'Common7\IDE\CommonExtensions\Microsoft\TestWindow\vstest.console.exe' } |
+    Where-Object { [System.IO.File]::Exists($_) } |
+    Select-Object -First 1
+if (-not $vstestPath) {
+    throw "No Visual Studio installation with vstest.console.exe was found. vswhere listed $($installationPaths.Count) installation(s)."
 }
 
 # A short staging root keeps result attachment paths below MAX_PATH.
