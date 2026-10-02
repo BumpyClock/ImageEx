@@ -1303,6 +1303,14 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             targetHeight = Math.Max(1, Math.Round(targetWidth * (naturalHeight / (double)naturalWidth)));
         }
 
+        // Never enlarge past the source. One scale keeps the requested aspect ratio.
+        var naturalScale = Math.Min(1, Math.Min(naturalWidth / targetWidth, naturalHeight / targetHeight));
+        if (naturalScale < 1)
+        {
+            targetWidth = Math.Min(naturalWidth, Math.Max(1, Math.Round(targetWidth * naturalScale)));
+            targetHeight = Math.Min(naturalHeight, Math.Max(1, Math.Round(targetHeight * naturalScale)));
+        }
+
         if (targetWidth * targetHeight > MaxRasterDecodePixels)
         {
             var scale = Math.Sqrt(MaxRasterDecodePixels / (targetWidth * targetHeight));

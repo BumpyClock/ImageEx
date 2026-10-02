@@ -5,9 +5,12 @@ The ImageEx control extends the platform Image control. It loads source images a
 Cached candidates accept at most 8 MiB of source bytes. Original raster candidates accept at most 32 MiB. SVG candidates retain the 8 MiB limit. Both routes reject oversized declared responses and stop chunked responses at the limit.
 
 Raster byte and file decodes use at most 2,097,152 physical pixels, or 8 MiB of BGRA data.
-Logical decode dimensions use the supplied DPI scale, clamped to 0.5 through 4.0, before the pixel limit applies.
+Logical decode dimensions use the supplied DPI scale, clamped to 0.5 through 4.0, before the limits apply.
 Physical decode dimensions do not receive this scale.
 With no explicit dimensions, the fallback width receives the DPI scale once.
+A missing axis follows the natural aspect ratio of the source.
+A raster decode never exceeds the natural dimensions of its source, and the pixel limit then applies to the result. There is no enlargement exception.
+When the requested box exceeds the source on either axis, one scale reduces both axes. The box keeps its requested aspect ratio, even when the source differs.
 The pixel limit does not bound codec buffers, SVG images, or native URI decodes.
 
 Debug builds collect detailed image and cache logs with process-memory samples.
@@ -42,6 +45,12 @@ HTTP or decode failures advance to the next candidate. Cancellation stops the re
 
 SVG response media types use a case-insensitive comparison.
 SVG metadata accepts a `DOCTYPE` declaration without external resource resolution or DTD entity expansion.
+
+## Completion and natural size
+
+A current direct-URI load that resolves without an image enters the failed visual state and raises `ImageExFailed` once, as ordered requests already do. Canceled, replaced, and unloaded requests stay silent. The `DIGESTS_IMAGEEX_DISABLE_HTTP_IMAGES` diagnostic switch suppresses HTTP loads without a failure event on direct loads.
+
+`ImageExBase.TryGetNaturalSize(out Size)` reports the natural pixel size of the image currently attached to the control, from cache metadata when present and otherwise from the decoded bitmap. A bitmap the platform resized while decoding (a `DecodePixelWidth` or `DecodePixelHeight` on a direct load without the managed cache) has no natural size, so the method returns false. It returns false until an image is attached and after the source clears, so a late completion cannot change a replacement image dimensions.
 
 ## Regression checks
 

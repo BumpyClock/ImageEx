@@ -33,6 +33,36 @@ namespace ImageEx
 
         internal bool IsInViewport => _isInViewport;
 
+        /// <summary>
+        /// Gets the natural pixel size of the image currently attached to the control.
+        /// The size comes from cache metadata when available, otherwise from a bitmap the platform did not resize while decoding.
+        /// </summary>
+        /// <param name="size">The natural size when the attached image reports one.</param>
+        /// <returns>True when the control reports a natural size.</returns>
+        public bool TryGetNaturalSize(out Size size)
+        {
+            size = default;
+            var source = _currentImageSource;
+            if (source == null)
+            {
+                return false;
+            }
+
+            if (ImageExSourceMetadata.TryGetNaturalSize(source, out size))
+            {
+                return true;
+            }
+
+            if (source is BitmapSource { PixelWidth: > 0, PixelHeight: > 0 } bitmap
+                && bitmap is not BitmapImage { DecodePixelWidth: > 0 } and not BitmapImage { DecodePixelHeight: > 0 })
+            {
+                size = new Size(bitmap.PixelWidth, bitmap.PixelHeight);
+                return true;
+            }
+
+            return false;
+        }
+
         private void OnImageExUnloaded(object sender, RoutedEventArgs e)
         {
             // A queued Unloaded event can arrive after the control has loaded again.
@@ -434,8 +464,16 @@ namespace ImageEx
 
                     if (CanAttachResolvedSource(requestVersion, requestTokenSource, requestToken, result.Image))
                     {
-                        // Attach the image only while this request remains active.
-                        AttachSource(result.Image, shouldAnimateLoadedState: !result.IsCacheHit);
+                        if (result.Image != null || ImageExDiagnostics.DisableHttpImages)
+                        {
+                            // Attach the image only while this request remains active. Diagnostic suppression keeps the empty attach.
+                            AttachSource(result.Image, shouldAnimateLoadedState: !result.IsCacheHit);
+                        }
+                        else
+                        {
+                            VisualStateManager.GoToState(this, FailedState, true);
+                            ImageExFailed?.Invoke(this, new ImageExFailedEventArgs(new IOException("The image could not be loaded.")));
+                        }
                     }
                 }
                 else if (string.Equals(imageUri.Scheme, "data", StringComparison.OrdinalIgnoreCase))
