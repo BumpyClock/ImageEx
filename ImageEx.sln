@@ -5,6 +5,8 @@ VisualStudioVersion = 17.7.34221.43
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ImageEx", "ImageEx\ImageEx.csproj", "{FFAA6C85-06E6-4D7E-9C7D-FB375DDC4667}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ImageEx.Hosted.Tests", "tests\ImageEx.Hosted.Tests\ImageEx.Hosted.Tests.csproj", "{BC0269BE-DC1F-4C67-8101-2963A70C8906}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -27,6 +29,18 @@ Global
 		{FFAA6C85-06E6-4D7E-9C7D-FB375DDC4667}.Release|x64.Build.0 = Release|x64
 		{FFAA6C85-06E6-4D7E-9C7D-FB375DDC4667}.Release|x86.ActiveCfg = Release|x86
 		{FFAA6C85-06E6-4D7E-9C7D-FB375DDC4667}.Release|x86.Build.0 = Release|x86
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Debug|ARM64.Build.0 = Debug|ARM64
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Debug|x64.ActiveCfg = Debug|x64
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Debug|x64.Build.0 = Debug|x64
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Debug|x86.ActiveCfg = Debug|x86
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Debug|x86.Build.0 = Debug|x86
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Release|ARM64.ActiveCfg = Release|ARM64
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Release|ARM64.Build.0 = Release|ARM64
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Release|x64.ActiveCfg = Release|x64
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Release|x64.Build.0 = Release|x64
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Release|x86.ActiveCfg = Release|x86
+		{BC0269BE-DC1F-4C67-8101-2963A70C8906}.Release|x86.Build.0 = Release|x86
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

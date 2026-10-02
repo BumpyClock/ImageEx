@@ -1,5 +1,4 @@
 using System.Net;
-using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Foundation;
 
 namespace ImageEx.Hosted.Tests;

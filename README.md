@@ -58,3 +58,11 @@ Run `dotnet run --project tests/ImageEx.Metadata.Tests/ImageEx.Metadata.Tests.cs
 Run `dotnet run --project tests/ImageEx.Transport.Tests/ImageEx.Transport.Tests.csproj` for bounded transport checks.
 These projects link production helpers. Transport checks use a decoder stub and do not validate WinUI playback or layout.
 Run `dotnet build ImageEx/ImageEx.csproj -p:Platform=x64` to compile the WinUI library.
+
+Run `pwsh -NoProfile -File scripts/run-winui-hosted-tests.ps1` for the packaged WinUI checks in `tests/ImageEx.Hosted.Tests`.
+These tests host the production control and cache manager in a window and decode real images.
+They cover direct-load completion, natural size, the raster decode ceiling and budgets, and `DisableHttpImages` suppression.
+The command needs Windows 11 with an interactive desktop session, PowerShell 7, the .NET 10 SDK, Visual Studio with `vstest.console.exe`, and the Windows App SDK 2.x runtime.
+It builds the x64 test package and registers it as a development package named `ImageEx.Hosted.Tests`.
+It writes results to `artifacts/test-results` and the latest result to `artifacts/test-results/imageex-hosted.trx`.
+It fails when the result is missing or incomplete, or when any test is skipped or fails.
