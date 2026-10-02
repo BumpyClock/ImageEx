@@ -56,37 +56,55 @@ public sealed class NaturalSizeTests
         }
     }
 
+    private static readonly Uri PlatformFixture = new("ms-appx:///Fixtures/natural-1024x512.png");
+
     [UITestMethod]
-    [DataRow(32, 0, DisplayName = "width only")]
-    [DataRow(0, 16, DisplayName = "height only")]
-    [DataRow(32, 16, DisplayName = "both axes")]
-    public async Task Platform_resized_bitmap_has_no_natural_size(int decodeWidth, int decodeHeight)
+    public Task Platform_resized_bitmap_by_width_has_no_natural_size() => AssertPlatformResizedAsync(128, 0);
+
+    [UITestMethod]
+    public Task Platform_resized_bitmap_by_height_has_no_natural_size() => AssertPlatformResizedAsync(0, 64);
+
+    [UITestMethod]
+    public Task Platform_resized_bitmap_by_both_axes_has_no_natural_size() => AssertPlatformResizedAsync(128, 64);
+
+    [UITestMethod]
+    public async Task Unresized_platform_bitmap_reports_its_natural_size()
+    {
+        await using var harness = await ControlHarness.CreateAsync(manager: null);
+        var bitmap = await LoadPlatformBitmapAsync(harness);
+
+        Assert.AreEqual(1024, bitmap.PixelWidth);
+        Assert.AreEqual(512, bitmap.PixelHeight);
+        Assert.IsTrue(harness.TryGetNaturalSize(out var size));
+        Assert.AreEqual(new Size(1024, 512), size);
+    }
+
+    // A local URI takes the platform decode path, which applies the control's decode size to the BitmapImage.
+    // Measured on Windows App SDK runtime 2.5.1: PixelWidth and PixelHeight still report the 1024x512 source
+    // after ImageOpened. The contract still requires false for any bitmap with a decode size set.
+    private static async Task AssertPlatformResizedAsync(int decodeWidth, int decodeHeight)
     {
         await using var harness = await ControlHarness.CreateAsync(manager: null, control =>
         {
             control.DecodePixelWidth = decodeWidth;
             control.DecodePixelHeight = decodeHeight;
         });
-        harness.Control.Source = new Uri("ms-appx:///Fixtures/natural-64x32.png");
-        await harness.WaitForOpenedAsync();
-        await TestWait.ForConditionAsync(
-            () => harness.DisplayedSource is BitmapImage { PixelWidth: > 0, PixelHeight: > 0 },
-            "the platform bitmap to decode");
+        var bitmap = await LoadPlatformBitmapAsync(harness);
 
+        Assert.AreEqual(
+            (decodeWidth, decodeHeight),
+            (bitmap.DecodePixelWidth, bitmap.DecodePixelHeight),
+            "Precondition: the displayed bitmap does not carry the requested decode size.");
         Assert.IsFalse(harness.TryGetNaturalSize(out var size), $"A platform-resized bitmap reported {size}.");
     }
 
-    [UITestMethod]
-    public async Task Unresized_platform_bitmap_reports_its_natural_size()
+    private static async Task<BitmapImage> LoadPlatformBitmapAsync(ControlHarness harness)
     {
-        await using var harness = await ControlHarness.CreateAsync(manager: null);
-        harness.Control.Source = new Uri("ms-appx:///Fixtures/natural-64x32.png");
+        harness.Control.Source = PlatformFixture;
         await harness.WaitForOpenedAsync();
         await TestWait.ForConditionAsync(
             () => harness.DisplayedSource is BitmapImage { PixelWidth: > 0, PixelHeight: > 0 },
             "the platform bitmap to decode");
-
-        Assert.IsTrue(harness.TryGetNaturalSize(out var size));
-        Assert.AreEqual(new Size(64, 32), size);
+        return (BitmapImage)harness.DisplayedSource!;
     }
 }

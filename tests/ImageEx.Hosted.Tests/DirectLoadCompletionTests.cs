@@ -91,7 +91,7 @@ public sealed class DirectLoadCompletionTests
     }
 
     [UITestMethod]
-    public async Task Replacement_rejects_late_image_and_natural_size()
+    public async Task Replacement_cancels_a_pending_download_silently()
     {
         using var directory = new TempCacheDirectory();
         var handler = new FixtureHandler();
@@ -138,6 +138,108 @@ public sealed class DirectLoadCompletionTests
     public Task Unload_retires_a_pending_failure_silently()
         => AssertUnloadRetiresSilentlyAsync(
             (handler, uri) => handler.ServeGated(uri, Array.Empty<byte>(), status: HttpStatusCode.NotFound));
+
+    // The late-completion tests below deliver a real decoded image after its request was retired.
+    [UITestMethod]
+    public async Task Replacement_rejects_a_resolved_late_image_and_natural_size()
+    {
+        using var directory = new TempCacheDirectory();
+        var retired = TestUris.Next("late-landscape.png");
+        var replacement = TestUris.Next("replacement-portrait.png");
+        var handler = new FixtureHandler()
+            .Serve(retired, await ImageFixtures.PngAsync(320, 160, Bgra.Red))
+            .Serve(replacement, await ImageFixtures.PngAsync(40, 80, Bgra.Blue));
+        var manager = new ImageExCacheManager(directory.Path, handler);
+        LateCompletion? late = null;
+        try
+        {
+            await using var harness = await ControlHarness.CreateAsync(manager);
+            late = harness.Control.HoldCompletion(retired);
+            harness.Control.Source = retired;
+            AssertLateImage(await late.WaitUntilResolvedAsync(), 320, 160);
+
+            harness.Control.Source = replacement;
+            await harness.WaitForOpenedAsync();
+            var displayed = harness.DisplayedSource;
+            var openedBeforeRelease = harness.OpenedCount;
+
+            late.Release();
+            await harness.SettleAsync();
+
+            Assert.AreEqual(0, harness.FailedCount);
+            Assert.AreEqual(openedBeforeRelease, harness.OpenedCount, "The late completion opened an image.");
+            Assert.AreEqual("Loaded", harness.CurrentState);
+            Assert.AreSame(displayed, harness.DisplayedSource, "The late completion replaced the displayed image.");
+            ImageFixtures.AssertColor(ImageFixtures.AssertRaster(harness.DisplayedSource, 40, 80, "replacement"), Bgra.Blue, "replacement");
+            Assert.IsTrue(harness.TryGetNaturalSize(out var size));
+            Assert.AreEqual(new Size(40, 80), size, "The late completion changed the natural size.");
+        }
+        finally
+        {
+            late?.Release();
+            await manager.DisposeAsync();
+        }
+    }
+
+    [UITestMethod]
+    public async Task Clearing_rejects_a_resolved_late_image()
+    {
+        await AssertResolvedLateImageRejectedAsync(
+            harness =>
+            {
+                harness.Control.Source = null;
+                return Task.CompletedTask;
+            },
+            expectedState: "Unloaded");
+    }
+
+    [UITestMethod]
+    public async Task Unload_rejects_a_resolved_late_image()
+    {
+        await AssertResolvedLateImageRejectedAsync(harness => harness.RemoveFromTreeAsync(), expectedState: null);
+    }
+
+    private static async Task AssertResolvedLateImageRejectedAsync(Func<ControlHarness, Task> retire, string? expectedState)
+    {
+        using var directory = new TempCacheDirectory();
+        var retired = TestUris.Next("late.png");
+        var handler = new FixtureHandler().Serve(retired, await ImageFixtures.PngAsync(320, 160, Bgra.Red));
+        var manager = new ImageExCacheManager(directory.Path, handler);
+        LateCompletion? late = null;
+        try
+        {
+            await using var harness = await ControlHarness.CreateAsync(manager);
+            late = harness.Control.HoldCompletion(retired);
+            harness.Control.Source = retired;
+            AssertLateImage(await late.WaitUntilResolvedAsync(), 320, 160);
+
+            await retire(harness);
+            late.Release();
+            await harness.SettleAsync();
+
+            Assert.AreEqual(0, harness.FailedCount, "ImageExFailed count.");
+            Assert.AreEqual(0, harness.OpenedCount, "The late completion opened an image.");
+            if (expectedState != null)
+            {
+                Assert.AreEqual(expectedState, harness.CurrentState);
+            }
+
+            Assert.IsNull(harness.DisplayedSource, "The late completion attached its image.");
+            Assert.IsFalse(harness.TryGetNaturalSize(out var size), $"The late completion reported natural size {size}.");
+        }
+        finally
+        {
+            late?.Release();
+            await manager.DisposeAsync();
+        }
+    }
+
+    // Proves the held request produced a real image, so the control alone must reject it.
+    private static void AssertLateImage(ImageLoadResult result, double naturalWidth, double naturalHeight)
+    {
+        Assert.IsNotNull(result.Image, "Precondition: the held request did not resolve an image.");
+        ImageFixtures.AssertNaturalSize(result.Image, naturalWidth, naturalHeight, "held request");
+    }
 
     private static async Task AssertDirectLoadFailsOnceAsync(Action<FixtureHandler, Uri> route)
     {

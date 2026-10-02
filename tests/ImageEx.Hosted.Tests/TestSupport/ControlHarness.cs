@@ -14,7 +14,7 @@ internal sealed class ControlHarness : IAsyncDisposable
     private readonly Grid _host;
     private bool _unloaded;
 
-    private ControlHarness(ImageExControl control, Window window, Grid host)
+    private ControlHarness(ObservedImageEx control, Window window, Grid host)
     {
         Control = control;
         Window = window;
@@ -24,7 +24,7 @@ internal sealed class ControlHarness : IAsyncDisposable
         control.Unloaded += (_, _) => _unloaded = true;
     }
 
-    public ImageExControl Control { get; }
+    public ObservedImageEx Control { get; }
 
     public Window Window { get; }
 
@@ -52,7 +52,7 @@ internal sealed class ControlHarness : IAsyncDisposable
     /// </summary>
     public static async Task<ControlHarness> CreateAsync(ImageExCacheManager? manager, Action<ImageExControl>? configure = null)
     {
-        var control = new ImageExControl
+        var control = new ObservedImageEx
         {
             CacheManagerOverride = manager,
             IsCacheEnabled = true,
@@ -66,14 +66,22 @@ internal sealed class ControlHarness : IAsyncDisposable
         host.Children.Add(control);
         var window = new Window { Content = host };
         var harness = new ControlHarness(control, window, host);
-        window.Activate();
-        await TestWait.ForConditionAsync(() => control.IsLoaded, "the control to load");
-        control.ApplyTemplate();
-        Assert.IsNotNull(FindImagePart(control), "The production template has no Image part.");
+        try
+        {
+            window.Activate();
+            await TestWait.ForConditionAsync(() => control.IsLoaded, "the control to load");
+            control.ApplyTemplate();
+            Assert.IsNotNull(FindImagePart(control), "The production template has no Image part.");
 
-        // Drain the deferred initial viewport check before a test assigns a source.
-        await TestWait.ForDispatcherIdleAsync(harness.Dispatcher);
-        return harness;
+            // Drain the deferred initial viewport check before a test assigns a source.
+            await TestWait.ForDispatcherIdleAsync(harness.Dispatcher);
+            return harness;
+        }
+        catch
+        {
+            window.Close();
+            throw;
+        }
     }
 
     public Task WaitForOpenedAsync(int count = 1)
@@ -81,13 +89,20 @@ internal sealed class ControlHarness : IAsyncDisposable
             () => OpenedCount >= count && CurrentState == "Loaded" && DisplayedSource != null,
             $"ImageExOpened #{count} with the Loaded state and a displayed image");
 
-    public Task SettleAsync() => TestWait.ForDispatcherIdleAsync(Dispatcher);
+    /// <summary>
+    /// Waits for every resolve the control started, then for the dispatcher to run their continuations.
+    /// </summary>
+    public async Task SettleAsync()
+    {
+        await Control.WhenResolvesCompleteAsync();
+        await TestWait.ForDispatcherIdleAsync(Dispatcher);
+    }
 
     public async Task RemoveFromTreeAsync()
     {
         _host.Children.Remove(Control);
         await TestWait.ForConditionAsync(() => _unloaded && !Control.IsLoaded, "the control to unload");
-        await SettleAsync();
+        await TestWait.ForDispatcherIdleAsync(Dispatcher);
     }
 
     public bool TryGetNaturalSize(out Size size) => Control.TryGetNaturalSize(out size);

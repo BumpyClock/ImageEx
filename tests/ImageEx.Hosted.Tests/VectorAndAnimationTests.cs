@@ -55,11 +55,12 @@ public sealed class VectorAndAnimationTests
 
     private static async Task<ControlHarness> LoadDirectAsync(Uri uri, byte[] body, string contentType, Action<ImageExControl>? configure = null)
     {
-        var directory = new TempCacheDirectory();
+        using var directory = new TempCacheDirectory();
         var manager = new ImageExCacheManager(directory.Path, new FixtureHandler().Serve(uri, body, contentType));
-        var harness = await ControlHarness.CreateAsync(manager, configure);
+        ControlHarness? harness = null;
         try
         {
+            harness = await ControlHarness.CreateAsync(manager, configure);
             harness.Control.Source = uri;
             await harness.WaitForOpenedAsync();
             await manager.DisposeAsync();
@@ -70,13 +71,16 @@ public sealed class VectorAndAnimationTests
         }
         catch
         {
-            await harness.DisposeAsync();
+            if (harness != null)
+            {
+                await harness.DisposeAsync();
+            }
+
             throw;
         }
         finally
         {
             await manager.DisposeAsync();
-            directory.Dispose();
         }
     }
 }

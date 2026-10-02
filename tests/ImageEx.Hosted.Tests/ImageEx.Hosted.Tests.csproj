@@ -35,7 +35,7 @@
     <Content Include="Assets\Square150x150Logo.scale-100.png" />
     <Content Include="Assets\Square44x44Logo.scale-100.png" />
     <Content Include="Assets\StoreLogo.scale-100.png" />
-    <Content Include="Fixtures\natural-64x32.png" />
+    <Content Include="Fixtures\natural-1024x512.png" />
     <Manifest Include="$(ApplicationManifest)" />
   </ItemGroup>
 

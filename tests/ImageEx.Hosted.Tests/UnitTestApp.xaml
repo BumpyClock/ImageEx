@@ -2,12 +2,15 @@
 <Application
     x:Class="ImageEx.Hosted.Tests.UnitTestApp"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:tests="using:ImageEx.Hosted.Tests">
     <Application.Resources>
         <ResourceDictionary>
             <ResourceDictionary.MergedDictionaries>
                 <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
             </ResourceDictionary.MergedDictionaries>
+            <!-- XAML needs generated type information for the test subclass. This reference produces it. -->
+            <Style x:Key="ObservedImageExTypeReference" TargetType="tests:ObservedImageEx" />
         </ResourceDictionary>
     </Application.Resources>
 </Application>
