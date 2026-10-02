@@ -4,10 +4,10 @@ namespace ImageEx.Hosted.Tests;
 
 internal static class TestWait
 {
-    private static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(10);
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(10);
 
-    public static async Task ForConditionAsync(Func<bool> predicate, TimeSpan? timeout = null)
+    public static async Task ForConditionAsync(Func<bool> predicate, string description, TimeSpan? timeout = null)
     {
         var limit = timeout ?? DefaultTimeout;
         using var cts = new CancellationTokenSource(limit);
@@ -20,12 +20,20 @@ internal static class TestWait
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
-            throw new TimeoutException($"Condition was not met within {limit.TotalMilliseconds:0}ms.");
+            Assert.Fail($"Timed out after {limit.TotalSeconds:0}s waiting for {description}.");
         }
     }
 
-    // Completes after every dispatcher item queued at normal or higher priority has run.
-    public static async Task ForDispatcherIdleAsync(DispatcherQueue dispatcherQueue, int passes = 2)
+    public static async Task ForTaskAsync(Task task, string description)
+    {
+        if (await Task.WhenAny(task, Task.Delay(DefaultTimeout)) != task)
+        {
+            Assert.Fail($"Timed out after {DefaultTimeout.TotalSeconds:0}s waiting for {description}.");
+        }
+    }
+
+    // Each pass completes after the dispatcher runs every item queued above low priority.
+    public static async Task ForDispatcherIdleAsync(DispatcherQueue dispatcherQueue, int passes = 3)
     {
         for (var i = 0; i < passes; i++)
         {
@@ -35,7 +43,7 @@ internal static class TestWait
                 throw new InvalidOperationException("The dispatcher rejected the idle marker.");
             }
 
-            await completion.Task.WaitAsync(DefaultTimeout);
+            await ForTaskAsync(completion.Task, "the dispatcher to drain");
         }
     }
 }
