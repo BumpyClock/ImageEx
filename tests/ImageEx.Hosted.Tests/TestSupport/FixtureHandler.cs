@@ -16,6 +16,7 @@ internal static class TestUris
 internal sealed class FixtureHandler : HttpMessageHandler
 {
     private readonly ConcurrentDictionary<string, Route> _routes = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ScriptedRoute> _scripted = new(StringComparer.Ordinal);
 
     public FixtureHandler Serve(Uri uri, byte[] body, string contentType = "image/png", HttpStatusCode status = HttpStatusCode.OK)
     {
@@ -24,6 +25,16 @@ internal sealed class FixtureHandler : HttpMessageHandler
     }
 
     public FixtureHandler ServeStatus(Uri uri, HttpStatusCode status) => Serve(uri, Array.Empty<byte>(), status: status);
+
+    /// <summary>
+    /// Returns headers at once, then a PNG body that follows one script per request. The last script repeats.
+    /// </summary>
+    public FixtureHandler ServeScripted(Uri uri, byte[] body, params BodyScript[] attempts)
+    {
+        ArgumentOutOfRangeException.ThrowIfZero(attempts.Length);
+        _scripted[uri.AbsoluteUri] = new ScriptedRoute(body, attempts);
+        return this;
+    }
 
     public Gate ServeGated(Uri uri, byte[] body, string contentType = "image/png", HttpStatusCode status = HttpStatusCode.OK)
     {
@@ -34,6 +45,13 @@ internal sealed class FixtureHandler : HttpMessageHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
+        if (_scripted.TryGetValue(request.RequestUri!.AbsoluteUri, out var scripted))
+        {
+            var scriptedContent = new ScriptedContent(scripted.Body, scripted.NextScript());
+            scriptedContent.Headers.ContentType = new MediaTypeHeaderValue("image/png");
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = scriptedContent };
+        }
+
         if (!_routes.TryGetValue(request.RequestUri!.AbsoluteUri, out var route))
         {
             return new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new ByteArrayContent(Array.Empty<byte>()) };
@@ -49,6 +67,15 @@ internal sealed class FixtureHandler : HttpMessageHandler
         var content = new ByteArrayContent(route.Body);
         content.Headers.ContentType = new MediaTypeHeaderValue(route.ContentType);
         return new HttpResponseMessage(route.Status) { Content = content };
+    }
+
+    private sealed class ScriptedRoute(byte[] body, BodyScript[] attempts)
+    {
+        private int _next = -1;
+
+        public byte[] Body { get; } = body;
+
+        public BodyScript NextScript() => attempts[Math.Min(Interlocked.Increment(ref _next), attempts.Length - 1)];
     }
 
     private sealed class Route(byte[] body, string contentType, HttpStatusCode status, Gate? gate)

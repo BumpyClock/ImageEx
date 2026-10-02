@@ -73,6 +73,8 @@ Run `dotnet build ImageEx/ImageEx.csproj -p:Platform=x64` to compile the WinUI l
 Run `pwsh -NoProfile -File scripts/run-winui-hosted-tests.ps1` for the packaged WinUI checks in `tests/ImageEx.Hosted.Tests`.
 These tests host the production control and cache manager in a window and decode real images.
 They cover direct-load completion, natural size, the raster decode ceiling and budgets, and `DisableHttpImages` suppression.
+They also cover response bodies that stall after their headers. These checks include idle expiry, retries, failure backoff, download slot release, shared-waiter cancellation, candidate fallback, and original temporary-file cleanup.
+These tests use a short internal idle timeout. No test waits for the real 30-second timeout.
 The command needs Windows 11 with an interactive desktop session, PowerShell 7, the .NET 10 SDK, Visual Studio with `vstest.console.exe`, and the Windows App SDK 2.x runtime.
 It builds the x64 test package and registers it as a development package named `ImageEx.Hosted.Tests`.
 It keeps each run's raw results in `artifacts/test-results` and validates that run's own result.
