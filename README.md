@@ -50,7 +50,7 @@ SVG metadata accepts a `DOCTYPE` declaration without external resource resolutio
 
 A current direct-URI load that resolves without an image enters the failed visual state and raises `ImageExFailed` once, as ordered requests already do. Canceled, replaced, and unloaded requests stay silent. The `DIGESTS_IMAGEEX_DISABLE_HTTP_IMAGES` diagnostic switch suppresses HTTP loads without a failure event on direct loads.
 
-`ImageExBase.TryGetNaturalSize(out Size)` reports the natural pixel size of the image currently attached to the control, from cache metadata when present and otherwise from the decoded bitmap. It returns false until an image is attached and after the source clears, so a late completion cannot change a replacement image dimensions.
+`ImageExBase.TryGetNaturalSize(out Size)` reports the natural pixel size of the image currently attached to the control, from cache metadata when present and otherwise from the decoded bitmap. A bitmap the platform resized while decoding (a `DecodePixelWidth` or `DecodePixelHeight` on a direct load without the managed cache) has no natural size, so the method returns false. It returns false until an image is attached and after the source clears, so a late completion cannot change a replacement image dimensions.
 
 ## Regression checks
 

@@ -35,9 +35,9 @@ namespace ImageEx
 
         /// <summary>
         /// Gets the natural pixel size of the image currently attached to the control.
-        /// The size comes from cache metadata when available, otherwise from the decoded bitmap.
+        /// The size comes from cache metadata when available, otherwise from a bitmap the platform did not resize while decoding.
         /// </summary>
-        /// <param name="size">The natural size when the attached image has decoded dimensions.</param>
+        /// <param name="size">The natural size when the attached image reports one.</param>
         /// <returns>True when the control reports a natural size.</returns>
         public bool TryGetNaturalSize(out Size size)
         {
@@ -53,7 +53,8 @@ namespace ImageEx
                 return true;
             }
 
-            if (source is BitmapSource { PixelWidth: > 0, PixelHeight: > 0 } bitmap)
+            if (source is BitmapSource { PixelWidth: > 0, PixelHeight: > 0 } bitmap
+                && bitmap is not BitmapImage { DecodePixelWidth: > 0 } and not BitmapImage { DecodePixelHeight: > 0 })
             {
                 size = new Size(bitmap.PixelWidth, bitmap.PixelHeight);
                 return true;
