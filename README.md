@@ -64,5 +64,7 @@ These tests host the production control and cache manager in a window and decode
 They cover direct-load completion, natural size, the raster decode ceiling and budgets, and `DisableHttpImages` suppression.
 The command needs Windows 11 with an interactive desktop session, PowerShell 7, the .NET 10 SDK, Visual Studio with `vstest.console.exe`, and the Windows App SDK 2.x runtime.
 It builds the x64 test package and registers it as a development package named `ImageEx.Hosted.Tests`.
-It writes results to `artifacts/test-results` and the latest result to `artifacts/test-results/imageex-hosted.trx`.
-It fails when the result is missing or incomplete, or when any test is skipped or fails.
+It keeps each run's raw results in `artifacts/test-results` and validates that run's own result.
+It fails when the result is missing or incomplete, when any test is skipped or fails, or when a test method reports more than one result.
+After a run passes, it copies the result to `artifacts/test-results/imageex-hosted.trx`.
+If the build rewrites `ImageEx/packages.lock.json`, the command puts back the committed content and prints a notice.
