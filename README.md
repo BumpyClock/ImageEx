@@ -43,6 +43,12 @@ HTTP or decode failures advance to the next candidate. Cancellation stops the re
 SVG response media types use a case-insensitive comparison.
 SVG metadata accepts a `DOCTYPE` declaration without external resource resolution or DTD entity expansion.
 
+## Completion and natural size
+
+A current direct-URI load that resolves without an image enters the failed visual state and raises `ImageExFailed` once, as ordered requests already do. Canceled, replaced, and unloaded requests stay silent. The `DIGESTS_IMAGEEX_DISABLE_HTTP_IMAGES` diagnostic switch suppresses HTTP loads without a failure event on direct loads.
+
+`ImageExBase.TryGetNaturalSize(out Size)` reports the natural pixel size of the image currently attached to the control, from cache metadata when present and otherwise from the decoded bitmap. It returns false until an image is attached and after the source clears, so a late completion cannot change a replacement image dimensions.
+
 ## Regression checks
 
 Run `dotnet run --project tests/ImageEx.Metadata.Tests/ImageEx.Metadata.Tests.csproj` for SVG metadata checks.
