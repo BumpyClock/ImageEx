@@ -5,12 +5,14 @@ Builds and runs the packaged ImageEx WinUI hosted tests.
 
 .DESCRIPTION
 Builds tests/ImageEx.Hosted.Tests for x64, runs its .build.appxrecipe through
-Visual Studio's vstest.console.exe, and publishes results under
-artifacts/test-results. The latest result is artifacts/test-results/imageex-hosted.trx.
+Visual Studio's vstest.console.exe, and keeps each run's raw results under
+artifacts/test-results. After a run passes validation, its TRX is copied to
+artifacts/test-results/imageex-hosted.trx.
 
-The script fails when the TRX is missing or incomplete, when it reports no
-results, when any result is not Passed, or when a test method in the packaged
-assembly has no result.
+The script validates this run's own TRX. It fails when the TRX is missing or
+incomplete, when it reports no results, when any result is not Passed, when a
+test method in the packaged assembly has no result, or when a method reports
+more than one result.
 #>
 [CmdletBinding()]
 param(
@@ -143,7 +145,8 @@ if (-not [System.IO.File]::Exists($projectPath)) {
 [System.IO.File]::Delete($stableTrxPath)
 
 if (-not $SkipBuild) {
-    # The SDK can rewrite the library lockfile during restore. Keep the committed file unchanged.
+    # Restore on a newer SDK can rewrite the committed library lockfile, and locked restore fails.
+    # Put back the committed content only when the build changed it.
     $lockFileSnapshot = [System.IO.File]::ReadAllBytes($lockFilePath)
     try {
         $buildExitCode = Invoke-Native {
@@ -157,7 +160,11 @@ if (-not $SkipBuild) {
         }
     }
     finally {
-        [System.IO.File]::WriteAllBytes($lockFilePath, $lockFileSnapshot)
+        $lockFileAfterBuild = [System.IO.File]::ReadAllBytes($lockFilePath)
+        if ([Convert]::ToBase64String($lockFileSnapshot) -cne [Convert]::ToBase64String($lockFileAfterBuild)) {
+            [System.IO.File]::WriteAllBytes($lockFilePath, $lockFileSnapshot)
+            Write-Host "Restored ImageEx/packages.lock.json after the build rewrote it."
+        }
     }
 
     if ($buildExitCode -ne 0) {
@@ -201,8 +208,10 @@ if (-not [System.IO.File]::Exists($vstestPath)) {
 }
 
 # A short staging root keeps result attachment paths below MAX_PATH.
-$staging = [System.IO.Directory]::CreateTempSubdirectory('ixh-')
-$runTrxName = "imageex-hosted-$([Guid]::NewGuid().ToString('N')).trx"
+$runId = [Guid]::NewGuid().ToString('N')
+$staging = [System.IO.Directory]::CreateDirectory((Join-Path ([System.IO.Path]::GetTempPath()) "ixh-$($runId.Substring(0, 8))"))
+$runTrxName = "imageex-hosted-$runId.trx"
+$published = Join-Path $resultsRoot "imageex-hosted-$runId"
 try {
     $testExitCode = Invoke-Native {
         & $vstestPath $recipes[0] '/Platform:x64' "/Logger:trx;LogFileName=$runTrxName" `
@@ -211,14 +220,7 @@ try {
 }
 finally {
     # Preserve raw results and diagnostics even when the run fails.
-    $published = Join-Path $resultsRoot ([System.IO.Path]::GetFileNameWithoutExtension($runTrxName))
     Copy-Item -LiteralPath $staging.FullName -Destination $published -Recurse
-    $runTrxPath = Join-Path $published $runTrxName
-    if ([System.IO.File]::Exists($runTrxPath)) {
-        $temporaryTrx = "$stableTrxPath.$([Guid]::NewGuid().ToString('N')).tmp"
-        Copy-Item -LiteralPath $runTrxPath -Destination $temporaryTrx
-        [System.IO.File]::Move($temporaryTrx, $stableTrxPath, $true)
-    }
     $staging.Delete($true)
 }
 
@@ -226,14 +228,16 @@ if ($testExitCode -ne 0) {
     throw "vstest.console.exe failed with exit code $testExitCode. Results: $published"
 }
 
-if (-not [System.IO.File]::Exists($stableTrxPath)) {
-    throw "The hosted run did not produce a TRX: $stableTrxPath"
+# Validate this invocation's own TRX. The stable copy is published only after it passes.
+$runTrxPath = Join-Path $published $runTrxName
+if (-not [System.IO.File]::Exists($runTrxPath)) {
+    throw "The hosted run did not produce a TRX: $runTrxPath"
 }
 
-[xml]$trx = [System.IO.File]::ReadAllText($stableTrxPath)
+[xml]$trx = [System.IO.File]::ReadAllText($runTrxPath)
 $summaries = @($trx.SelectNodes("/*[local-name()='TestRun']/*[local-name()='ResultSummary']"))
 if ($summaries.Count -ne 1 -or $summaries[0].GetAttribute('outcome') -notin @('Completed', 'Passed')) {
-    throw 'The TRX does not report a completed run.'
+    throw "The TRX does not report a completed run: $runTrxPath"
 }
 
 $definitions = @{}
@@ -245,13 +249,13 @@ foreach ($unitTest in $trx.SelectNodes("/*[local-name()='TestRun']/*[local-name(
 
 $results = @($trx.SelectNodes("/*[local-name()='TestRun']/*[local-name()='Results']/*[local-name()='UnitTestResult']"))
 if ($results.Count -eq 0) {
-    throw 'The TRX reports no test results.'
+    throw "The TRX reports no test results: $runTrxPath"
 }
 
 $nonPassing = @($results | Where-Object { $_.GetAttribute('outcome') -ne 'Passed' })
 if ($nonPassing.Count -ne 0) {
     $summary = ($nonPassing | ForEach-Object { "$($_.GetAttribute('testName')): $($_.GetAttribute('outcome'))" }) -join '; '
-    throw "Non-passing hosted results: $summary"
+    throw "Non-passing hosted results: $summary. TRX: $runTrxPath"
 }
 
 $executedNames = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -260,7 +264,10 @@ foreach ($result in $results) {
     if (-not $definitions.ContainsKey($testId)) {
         throw "TRX result '$($result.GetAttribute('testName'))' has no test definition."
     }
-    [void]$executedNames.Add($definitions[$testId])
+    if (-not $executedNames.Add($definitions[$testId])) {
+        # Data rows share one method name, so a missing row could hide behind a passing one.
+        throw "The TRX reports more than one result for $($definitions[$testId]). Write each case as its own test method."
+    }
 }
 
 $missing = @($discoveredNames | Where-Object { -not $executedNames.Contains($_) } | Sort-Object)
@@ -272,4 +279,8 @@ if ($unexpected.Count -ne 0) {
     throw "The TRX reports tests that the packaged assembly does not contain: $($unexpected -join '; ')"
 }
 
-Write-Host "Passed: $($results.Count) results cover all $($discoveredNames.Count) hosted tests. TRX: $stableTrxPath"
+$temporaryTrx = "$stableTrxPath.$runId.tmp"
+Copy-Item -LiteralPath $runTrxPath -Destination $temporaryTrx
+[System.IO.File]::Move($temporaryTrx, $stableTrxPath, $true)
+
+Write-Host "Passed: $($results.Count) hosted tests, one result each. TRX: $stableTrxPath"
