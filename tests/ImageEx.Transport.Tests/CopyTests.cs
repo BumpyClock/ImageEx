@@ -9,7 +9,7 @@ internal static class CopyTests
         using (var destination = new MemoryStream())
         {
             var count = await ImageExCacheManager.CopyOriginalSourceAsync(source, destination, 12,
-                CancellationToken.None, TimeSpan.FromMilliseconds(500));
+                CancellationToken.None, TimeSpan.FromSeconds(1));
             if (count != 12 || !destination.ToArray().AsSpan().SequenceEqual(payload)) throw new Exception("FAIL: progress copy.");
             Console.WriteLine("PASS: progress exceeds one idle budget and exact limit succeeds");
         }

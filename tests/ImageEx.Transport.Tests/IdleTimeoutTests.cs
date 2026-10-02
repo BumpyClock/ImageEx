@@ -3,10 +3,11 @@ using System.Net;
 using ImageEx.Cache;
 
 // Each case passes a guard token as the caller token. A missing deadline surfaces as guard cancellation, not a hang.
+// Outcomes are decided by exception identity and explicit signals, not by upper bounds on elapsed time.
 internal static class IdleTimeoutTests
 {
     internal static readonly TimeSpan Idle = TimeSpan.FromMilliseconds(100);
-    internal static readonly TimeSpan Guard = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan Guard = TimeSpan.FromSeconds(10);
 
     internal static async Task<int> RunAsync()
     {
@@ -28,7 +29,24 @@ internal static class IdleTimeoutTests
             passed++;
         }
 
-        using (var caller = new CancellationTokenSource())
+        // A stalled operation can report its canceled token as a non-cancellation error. Idle expiry still applies.
+        foreach (var (failure, name) in new (Func<Exception>, string)[]
+        {
+            (() => new IOException("Connection aborted."), nameof(IOException)),
+            (() => new ObjectDisposedException("source"), nameof(ObjectDisposedException))
+        })
+        {
+            await ExpectIdleExpiry($"stalled read reporting {name} expires", token =>
+                ImageExCacheManager.ReadSourceAsync(new StallStream(payload, 0, failWith: failure), new byte[8], Idle, token),
+                failure().GetType());
+            await ExpectIdleExpiry($"stalled acquisition reporting {name} expires", async token =>
+            {
+                using var stream = await ImageExCacheManager.OpenSourceStreamAsync(new StalledContent(failWith: failure), Idle, token);
+            }, failure().GetType());
+            passed += 2;
+        }
+
+        using (var caller = new CancellationTokenSource(Guard))
         {
             var stream = new StallStream(payload, 0, onStall: caller.Cancel);
             var error = await Capture(() => ImageExCacheManager.ReadSourceAsync(stream, new byte[8], Idle, caller.Token));
@@ -37,17 +55,26 @@ internal static class IdleTimeoutTests
             passed++;
         }
 
-        using (var caller = new CancellationTokenSource())
+        using (var caller = new CancellationTokenSource(Guard))
         {
-            // Both the deadline and the caller have fired before the read observes cancellation.
-            var stream = new RaceStream(Idle * 3, caller);
+            var stream = new StallStream(payload, 0, onStall: caller.Cancel, failWith: () => new IOException("Connection aborted."));
             var error = await Capture(() => ImageExCacheManager.ReadSourceAsync(stream, new byte[8], Idle, caller.Token));
-            Check(error is OperationCanceledException canceled && canceled.CancellationToken == caller.Token,
-                "caller cancellation wins a race with idle expiry");
+            Check(error is OperationCanceledException canceled and not TaskCanceledException && canceled.CancellationToken == caller.Token,
+                "caller cancellation wins over a read that reports IOException");
             passed++;
         }
 
-        using (var caller = new CancellationTokenSource())
+        using (var caller = new CancellationTokenSource(Guard))
+        {
+            // The read wakes only when its token cancels. The caller cancels after the deadline woke the read.
+            var stream = new DeadlineRaceStream(caller);
+            var error = await Capture(() => ImageExCacheManager.ReadSourceAsync(stream, new byte[8], Idle, caller.Token));
+            Check(stream.WokeByDeadline && error is OperationCanceledException canceled && canceled.CancellationToken == caller.Token,
+                "caller cancellation wins a race with a fired idle deadline");
+            passed++;
+        }
+
+        using (var caller = new CancellationTokenSource(Guard))
         {
             var stream = new StallStream(payload, int.MaxValue, onRead: caller.Cancel);
             var error = await Capture(() => ImageExCacheManager.ReadSourceAsync(stream, new byte[8], Idle, caller.Token));
@@ -56,7 +83,7 @@ internal static class IdleTimeoutTests
             passed++;
         }
 
-        using (var caller = new CancellationTokenSource())
+        using (var caller = new CancellationTokenSource(Guard))
         {
             var content = new StalledContent(onStall: caller.Cancel);
             var error = await Capture(() => ImageExCacheManager.OpenSourceStreamAsync(content, Idle, caller.Token));
@@ -65,7 +92,7 @@ internal static class IdleTimeoutTests
             passed++;
         }
 
-        using (var caller = new CancellationTokenSource())
+        using (var caller = new CancellationTokenSource(Guard))
         {
             var stream = new StallStream(payload, int.MaxValue);
             var content = new ImmediateContent(stream, onOpen: caller.Cancel);
@@ -78,11 +105,13 @@ internal static class IdleTimeoutTests
         using (var guard = new CancellationTokenSource(Guard))
         using (var destination = new MemoryStream())
         {
-            var source = Pattern(20);
+            // Each read waits a twentieth of the idle budget. The whole copy takes at least four idle budgets.
+            var idle = TimeSpan.FromMilliseconds(500);
+            var source = Pattern(80);
             var watch = Stopwatch.StartNew();
             var count = await ImageExCacheManager.CopyOriginalSourceAsync(
-                new DelayedStream(source, Idle / 4), destination, source.Length, guard.Token, Idle);
-            Check(count == source.Length && destination.ToArray().AsSpan().SequenceEqual(source) && watch.Elapsed > Idle * 3,
+                new DelayedStream(source, idle / 20), destination, source.Length, guard.Token, idle);
+            Check(count == source.Length && destination.ToArray().AsSpan().SequenceEqual(source) && watch.Elapsed >= idle * 4,
                 "progress across several idle budgets copies the exact payload");
             passed++;
         }
@@ -97,14 +126,14 @@ internal static class IdleTimeoutTests
         return bytes;
     }
 
-    private static async Task ExpectIdleExpiry(string name, Func<CancellationToken, Task> body)
+    private static async Task ExpectIdleExpiry(string name, Func<CancellationToken, Task> body, Type? reported = null)
     {
         using var guard = new CancellationTokenSource(Guard);
-        var watch = Stopwatch.StartNew();
         var error = await Capture(() => body(guard.Token));
-        Check(error is TaskCanceledException { InnerException: TimeoutException } expired
-            && expired.CancellationToken != guard.Token && !guard.IsCancellationRequested && watch.Elapsed < Guard / 2,
-            name + $" ({error?.GetType().Name ?? "no exception"}, {watch.ElapsedMilliseconds} ms)");
+        Check(error is TaskCanceledException { InnerException: TimeoutException timeout } expired
+            && expired.CancellationToken != guard.Token
+            && (reported == null || timeout.InnerException?.GetType() == reported),
+            name + $" ({error?.GetType().Name ?? "no exception"})");
     }
 
     private static async Task<Exception?> Capture(Func<Task> body)
@@ -128,7 +157,9 @@ internal static class IdleTimeoutTests
 }
 
 // Returns one byte per read and stalls every read once stallAt bytes have been returned, including the EOF read.
-internal sealed class StallStream(byte[] data, int stallAt, Action? onStall = null, Action? onRead = null) : Stream
+// A stalled read ends only when its token cancels. failWith replaces the cancellation with another exception.
+internal sealed class StallStream(byte[] data, int stallAt, Action? onStall = null, Action? onRead = null,
+    Func<Exception>? failWith = null) : Stream
 {
     private int _position;
 
@@ -139,7 +170,14 @@ internal sealed class StallStream(byte[] data, int stallAt, Action? onStall = nu
         if (_position >= stallAt)
         {
             onStall?.Invoke();
-            await Task.Delay(Timeout.Infinite, cancellationToken);
+            try
+            {
+                await Task.Delay(Timeout.Infinite, cancellationToken);
+            }
+            catch (OperationCanceledException) when (failWith != null)
+            {
+                throw failWith();
+            }
         }
 
         onRead?.Invoke();
@@ -166,15 +204,26 @@ internal sealed class StallStream(byte[] data, int stallAt, Action? onStall = nu
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }
 
-// Ignores its token until both the deadline and the caller have fired, then observes cancellation.
-internal sealed class RaceStream(TimeSpan wait, CancellationTokenSource caller) : MemoryStream(new byte[1])
+// Wakes only when its read token cancels. It records whether the caller was still clear at that point,
+// which means the idle deadline woke it. It then cancels the caller before reporting cancellation.
+internal sealed class DeadlineRaceStream(CancellationTokenSource caller) : MemoryStream(new byte[1])
 {
+    public bool WokeByDeadline { get; private set; }
+
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        await Task.Delay(wait, CancellationToken.None);
-        caller.Cancel();
-        cancellationToken.ThrowIfCancellationRequested();
-        throw new Exception("The read token did not observe cancellation.");
+        try
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            WokeByDeadline = !caller.IsCancellationRequested;
+            caller.Cancel();
+            throw;
+        }
+
+        throw new Exception("Unreachable");
     }
 }
 
@@ -189,7 +238,7 @@ internal sealed class DelayedStream(byte[] data, TimeSpan delay) : MemoryStream(
 }
 
 // Headers complete, then stream acquisition never completes unless its token cancels.
-internal sealed class StalledContent(Action? onStall = null) : HttpContent
+internal sealed class StalledContent(Action? onStall = null, Func<Exception>? failWith = null) : HttpContent
 {
     protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => throw new NotSupportedException();
     protected override bool TryComputeLength(out long length) { length = 0; return false; }
@@ -198,7 +247,15 @@ internal sealed class StalledContent(Action? onStall = null) : HttpContent
     protected override async Task<Stream> CreateContentReadStreamAsync(CancellationToken cancellationToken)
     {
         onStall?.Invoke();
-        await Task.Delay(Timeout.Infinite, cancellationToken);
+        try
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+        catch (OperationCanceledException) when (failWith != null)
+        {
+            throw failWith();
+        }
+
         throw new Exception("Unreachable");
     }
 }

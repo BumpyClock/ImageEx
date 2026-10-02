@@ -36,7 +36,9 @@ Each pending body read has a separate 30-second idle timeout. The timeout restar
 Opening the body stream also has a 30-second timeout. For original downloads, this budget is shared with the response headers.
 Destination writes, decoding, and queueing for a download slot do not count against these timeouts.
 A transfer can exceed 30 seconds in total if each read completes within its timeout. There is no limit on the total transfer duration.
-Cached downloads make up to three attempts when headers or the body time out, with short delays between attempts.
+Cached downloads make up to three attempts when the headers or the body time out, with short delays between attempts.
+A body operation counts as timed out when its idle timeout fires, whatever error the stream then reports.
+Network errors without an HTTP status also retry. Other body errors end the load without another attempt.
 After the last attempt, the load fails and the URL enters the ten-minute failure backoff.
 Original downloads and downloads with `EnableDiskCache = false` make one attempt.
 In an ordered request, a candidate that fails or times out advances to the next candidate.

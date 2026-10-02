@@ -70,33 +70,29 @@ using (var client = new HttpClient(new FakeHandler(async token =>
     }
 }
 // A guard token is the caller token. A missing idle deadline surfaces as guard cancellation instead of a hang.
+// Each stall group holds more loads than the four uncached slots. A leaked slot blocks the following load until the guard fires.
 using (var guard = new CancellationTokenSource(IdleTimeoutTests.Guard))
 using (var client = new HttpClient(new FakeHandler(_ =>
     Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StalledContent() }))))
 {
-    // More stalled loads than uncached slots. Queued loads start only after earlier ones release their slots.
     var stalled = await Guarded(guard, () => Task.WhenAll(Enumerable.Range(0, 6)
         .Select(_ => Resolve(ImageRequestMode.Cached, client, guard.Token, IdleTimeoutTests.Idle))));
-    Assert(stalled != null && stalled.All(result => result.Image == null), "Uncached stalled stream acquisitions terminate and release their slots");
+    Assert(stalled != null && stalled.All(result => result.Image == null), "Uncached stalled stream acquisitions terminate");
 }
+await AssertUncachedLoadSucceeds("Uncached load succeeds after stalled acquisitions release their slots");
 using (var guard = new CancellationTokenSource(IdleTimeoutTests.Guard))
 using (var client = new HttpClient(new FakeHandler(_ =>
     Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new StallStream(new byte[8], 3)) }))))
 {
-    var stalled = await Guarded(guard, () => Resolve(ImageRequestMode.Original, client, guard.Token, IdleTimeoutTests.Idle));
-    Assert(stalled is { Image: null }, "Uncached stalled body read terminates");
+    var stalled = await Guarded(guard, () => Task.WhenAll(Enumerable.Range(0, 6)
+        .Select(_ => Resolve(ImageRequestMode.Cached, client, guard.Token, IdleTimeoutTests.Idle))));
+    Assert(stalled != null && stalled.All(result => result.Image == null), "Uncached stalled mid-body reads terminate");
 }
-using (var guard = new CancellationTokenSource(IdleTimeoutTests.Guard))
-using (var client = new HttpClient(new FakeHandler(_ =>
-    Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(new byte[1024]) }))))
-{
-    var loaded = await Guarded(guard, () => Resolve(ImageRequestMode.Cached, client, guard.Token, IdleTimeoutTests.Idle));
-    Assert(loaded?.Image?.Bytes == 1024, "Uncached load succeeds after stalled loads terminate");
-}
+await AssertUncachedLoadSucceeds("Uncached load succeeds after stalled mid-body reads release their slots");
 
 await CopyTests.RunAsync();
 var idleScenarios = await IdleTimeoutTests.RunAsync();
-Console.WriteLine($"Passed 16 uncached transport scenarios, 5 copy scenarios, and {idleScenarios} idle timeout scenarios. WinUI decode is stubbed.");
+Console.WriteLine($"Passed 17 uncached transport scenarios, 5 copy scenarios, and {idleScenarios} idle timeout scenarios. WinUI decode is stubbed.");
 
 static Task<ImageExCacheManager.CacheResult> Resolve(ImageRequestMode mode, HttpClient client, CancellationToken token = default,
     TimeSpan? bodyIdleTimeout = null)
@@ -120,6 +116,15 @@ static void Assert(bool value, string name)
 {
     if (!value) throw new Exception("FAIL: " + name);
     Console.WriteLine("PASS: " + name);
+}
+
+static async Task AssertUncachedLoadSucceeds(string name)
+{
+    using var guard = new CancellationTokenSource(IdleTimeoutTests.Guard);
+    using var client = new HttpClient(new FakeHandler(_ =>
+        Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(new byte[1024]) })));
+    var loaded = await Guarded(guard, () => Resolve(ImageRequestMode.Cached, client, guard.Token, IdleTimeoutTests.Idle));
+    Assert(loaded?.Image?.Bytes == 1024, name);
 }
 
 sealed class FakeHandler(Func<CancellationToken, Task<HttpResponseMessage>> response) : HttpMessageHandler

@@ -44,13 +44,9 @@ internal sealed partial class ImageExCacheManager
         {
             stream = await content.ReadAsStreamAsync(deadline.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException error) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
+        catch (Exception error) when (ClassifyBodyFailure(error, deadline, token) is { } replacement)
         {
-            throw IdleTimeoutExpired(error, deadline.Token);
-        }
-        catch (OperationCanceledException error) when (token.IsCancellationRequested && error.CancellationToken != token)
-        {
-            throw new OperationCanceledException(error.Message, error, token);
+            throw replacement;
         }
 
         if (token.IsCancellationRequested)
@@ -73,20 +69,32 @@ internal sealed partial class ImageExCacheManager
         {
             read = await source.ReadAsync(buffer, deadline.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException error) when (!token.IsCancellationRequested && deadline.IsCancellationRequested)
+        catch (Exception error) when (ClassifyBodyFailure(error, deadline, token) is { } replacement)
         {
-            throw IdleTimeoutExpired(error, deadline.Token);
-        }
-        catch (OperationCanceledException error) when (token.IsCancellationRequested && error.CancellationToken != token)
-        {
-            throw new OperationCanceledException(error.Message, error, token);
+            throw replacement;
         }
 
         token.ThrowIfCancellationRequested();
         return read;
     }
 
-    private static TaskCanceledException IdleTimeoutExpired(OperationCanceledException error, CancellationToken deadline)
-        => new("Image source body made no progress within the idle timeout.",
-            new TimeoutException("Image source body idle timeout elapsed.", error), deadline);
+    // Returns the exception to throw instead of error, or null to rethrow error unchanged.
+    private static Exception? ClassifyBodyFailure(Exception error, CancellationTokenSource deadline, CancellationToken token)
+    {
+        // Read the deadline before the upstream token. Upstream cancellation sets its own state before it
+        // cancels the linked deadline, so a canceled deadline with a clear upstream token means the timer fired.
+        var deadlineCanceled = deadline.IsCancellationRequested;
+        if (token.IsCancellationRequested)
+        {
+            return error is OperationCanceledException canceled && canceled.CancellationToken == token
+                ? null
+                : new OperationCanceledException("Image source body operation was canceled.", error, token);
+        }
+
+        // A stalled stream can report its canceled operation as any exception type, such as IOException.
+        return deadlineCanceled
+            ? new TaskCanceledException("Image source body made no progress within the idle timeout.",
+                new TimeoutException("Image source body idle timeout elapsed.", error), deadline.Token)
+            : null;
+    }
 }
