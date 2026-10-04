@@ -47,6 +47,9 @@ In an ordered request, a candidate that fails or times out advances to the next 
 A download releases its download slot when it succeeds, fails, times out, or is canceled, so a stalled body cannot hold a slot indefinitely.
 Canceling a load or replacing its source stops the request as cancellation, not as a timeout.
 
+Manager disposal waits for accepted loads and shared downloads, including downloads whose final waiter already canceled.
+A canceled download leaves URI deduplication immediately, so a new request can start while transport cleanup finishes.
+
 Current disk entries use one URI source key, with separate `original-` keys for original-mode bytes.
 Legacy decode-parameter entries are no longer scanned or migrated on source misses.
 A URL with only a legacy entry downloads again and cannot use that entry offline if the download fails.
