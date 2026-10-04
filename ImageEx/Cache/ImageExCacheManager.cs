@@ -46,6 +46,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private readonly SemaphoreSlim _decodeConcurrency;
     private readonly object _lifetimeGate = new();
     private readonly long _maximumSourceBytes;
+    private readonly TimeSpan _bodyIdleTimeout;
     private DateTimeOffset _lastCleanup = DateTimeOffset.MinValue;
     private bool _initialSizeScanned;
     private bool _disposed;
@@ -123,8 +124,11 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         int maxConcurrentDownloads = 2,
         int maxConcurrentDecodes = 2,
         long maximumSourceBytes = ImageExCacheConstants.DefaultMaximumSourceBytes,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        TimeSpan? bodyIdleTimeout = null)
     {
+        _bodyIdleTimeout = bodyIdleTimeout ?? ImageExCacheConstants.SourceIdleTimeout;
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(_bodyIdleTimeout, TimeSpan.Zero, nameof(bodyIdleTimeout));
         _timeProvider = timeProvider ?? TimeProvider.System;
         _diskCache = new ImageExDiskCache(cacheDirectory);
         _httpClient = httpMessageHandler == null
@@ -785,7 +789,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 }
                 catch (TaskCanceledException) when (!token.IsCancellationRequested && attempt < maxAttempts - 1)
                 {
-                    // Timeout (not user-requested cancellation)
+                    // Header timeout or body idle timeout, not shared-download cancellation.
                     var delayMs = baseDelayMs * (1 << attempt);
                     await Task.Delay(delayMs, token).ConfigureAwait(false);
                 }
@@ -819,7 +823,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         var initialCapacity = declaredLength is > 0
             ? checked((int)declaredLength.Value)
             : (int)Math.Min(64 * 1024, _maximumSourceBytes);
-        using var source = await content.ReadAsStreamAsync(token).ConfigureAwait(false);
+        // Response headers use the client timeout. Stream acquisition and each pending read use the idle timeout.
+        using var source = await OpenSourceStreamAsync(content, _bodyIdleTimeout, token).ConfigureAwait(false);
         using var destination = new MemoryStream(initialCapacity);
         var copyBuffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
         try
@@ -828,9 +833,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             {
                 var remaining = _maximumSourceBytes - destination.Length;
                 var requestedBytes = (int)Math.Min(copyBuffer.Length, remaining + 1);
-                var read = await source
-                    .ReadAsync(copyBuffer.AsMemory(0, requestedBytes), token)
-                    .ConfigureAwait(false);
+                var read = await ReadSourceAsync(
+                    source, copyBuffer.AsMemory(0, requestedBytes), _bodyIdleTimeout, token).ConfigureAwait(false);
                 if (read == 0)
                 {
                     break;

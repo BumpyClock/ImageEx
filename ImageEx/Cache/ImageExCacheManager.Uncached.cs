@@ -15,8 +15,10 @@ internal sealed partial class ImageExCacheManager
     internal static async Task<CacheResult> GetUncachedImageAsync(
         ImageRequestCandidate candidate, int decodeWidth, int decodeHeight, DecodePixelType decodeType,
         CancellationToken token, DispatcherQueue? dispatcherQueue = null, double dpiScale = 1.0,
-        HttpClient? httpClient = null)
+        HttpClient? httpClient = null, TimeSpan? bodyIdleTimeout = null)
     {
+        var idleTimeout = bodyIdleTimeout ?? ImageExCacheConstants.SourceIdleTimeout;
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(idleTimeout, TimeSpan.Zero, nameof(bodyIdleTimeout));
         await UncachedConcurrency.WaitAsync(token).ConfigureAwait(false);
         try
         {
@@ -32,12 +34,12 @@ internal sealed partial class ImageExCacheManager
                 throw new IOException("Image exceeds source byte limit.");
             }
 
-            using var source = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
+            using var source = await OpenSourceStreamAsync(response.Content, idleTimeout, token).ConfigureAwait(false);
             var declaredLength = response.Content.Headers.ContentLength;
             using var bytes = new MemoryStream(declaredLength is > 0
                 ? checked((int)declaredLength.Value)
                 : 64 * 1024);
-            await CopyOriginalSourceAsync(source, bytes, maximumBytes, token).ConfigureAwait(false);
+            await CopyOriginalSourceAsync(source, bytes, maximumBytes, token, idleTimeout).ConfigureAwait(false);
             bytes.Position = 0;
             var image = await LoadFromStreamAsync(bytes, isSvg, decodeWidth, decodeHeight, decodeType,
                 dispatcherQueue, dpiScale, token, returnNullOnCancellation: false).ConfigureAwait(false);

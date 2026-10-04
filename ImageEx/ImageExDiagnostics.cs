@@ -49,7 +49,10 @@ namespace ImageEx
         private static long s_httpFallbackDecodedBytes;
         private static long s_baseBitmapCreatedCount;
 
-        public static bool DisableHttpImages => s_disableHttpImages;
+        // Hosted tests toggle suppression here because the environment switch is read once per process.
+        internal static bool? DisableHttpImagesOverride { get; set; }
+
+        public static bool DisableHttpImages => DisableHttpImagesOverride ?? s_disableHttpImages;
 
         public static bool DisableHttpFallback => s_disableHttpFallback;
 

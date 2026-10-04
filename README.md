@@ -31,8 +31,21 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 `ImageRequest` tries candidates in order until one succeeds. `ImageRequestMode` selects the source byte limit.
 Decoded memory entries remain separate for cached and original candidates, even with the same URI and decode dimensions.
-Original downloads allow 30 seconds for response headers and 30 seconds for each body read.
-A transfer can exceed 30 seconds if each read completes within its timeout.
+Managed image downloads allow 30 seconds for response headers.
+Each pending body read has a separate 30-second idle timeout. The timeout restarts for every read.
+Opening the body stream also has a separate 30-second idle timeout, including original downloads.
+Destination writes, decoding, and queueing for a download slot do not count against these timeouts.
+A transfer can exceed 30 seconds in total if each read completes within its timeout. There is no limit on the total transfer duration.
+Cached downloads make up to three attempts when the headers or the body time out. The delays between attempts are 200 ms and 400 ms.
+A body operation counts as timed out when its idle timeout fires, whatever error the stream then reports.
+Network errors without an HTTP status also retry. Other body errors end the load without another attempt.
+After the last attempt, the load fails and the URL enters the ten-minute failure backoff.
+A cached download keeps its download slot through all attempts and both delays.
+A thumbnail body that stalls on every attempt holds its slot for about three idle timeouts plus the delays. At the default timeout, that is about 90.6 seconds. The load then fails and releases the slot.
+Original downloads and downloads with `EnableDiskCache = false` make one attempt.
+In an ordered request, a candidate that fails or times out advances to the next candidate.
+A download releases its download slot when it succeeds, fails, times out, or is canceled, so a stalled body cannot hold a slot indefinitely.
+Canceling a load or replacing its source stops the request as cancellation, not as a timeout.
 
 Current disk entries use one URI source key, with separate `original-` keys for original-mode bytes.
 Legacy decode-parameter entries are no longer scanned or migrated on source misses.
@@ -58,3 +71,15 @@ Run `dotnet run --project tests/ImageEx.Metadata.Tests/ImageEx.Metadata.Tests.cs
 Run `dotnet run --project tests/ImageEx.Transport.Tests/ImageEx.Transport.Tests.csproj` for bounded transport checks.
 These projects link production helpers. Transport checks use a decoder stub and do not validate WinUI playback or layout.
 Run `dotnet build ImageEx/ImageEx.csproj -p:Platform=x64` to compile the WinUI library.
+
+Run `pwsh -NoProfile -File scripts/run-winui-hosted-tests.ps1` for the packaged WinUI checks in `tests/ImageEx.Hosted.Tests`.
+These tests host the production control and cache manager in a window and decode real images.
+They cover direct-load completion, natural size, the raster decode ceiling and budgets, and `DisableHttpImages` suppression.
+They also cover response bodies that stall after their headers. These checks include idle expiry, retries, failure backoff, download slot release, shared-waiter cancellation, candidate fallback, and original temporary-file cleanup.
+These tests use a short internal idle timeout. No test waits for the real 30-second timeout.
+The command needs Windows 11 with an interactive desktop session, PowerShell 7, the .NET 10 SDK, Visual Studio with `vstest.console.exe`, and the Windows App SDK 2.x runtime.
+It builds the x64 test package and registers it as a development package named `ImageEx.Hosted.Tests`.
+It keeps each run's raw results in `artifacts/test-results` and validates that run's own result.
+It fails when the result is missing or incomplete, when any test is skipped or fails, or when a test method reports more than one result.
+After a run passes, it copies the result to `artifacts/test-results/imageex-hosted.trx`.
+If the build rewrites `ImageEx/packages.lock.json`, the command puts back the committed content and prints a notice.
