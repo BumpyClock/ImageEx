@@ -283,6 +283,26 @@ public sealed class StalledBodyTests
         Assert.IsFalse(harness.TryGetNaturalSize(out _));
     }
 
+    [UITestMethod]
+    public async Task Original_stalled_acquisition_expires_and_releases_the_download_slot()
+    {
+        var stalled = TestUris.Next("stalled-original-acquisition.png");
+        var next = TestUris.Next("next-after-acquisition.png");
+        var handler = new FixtureHandler()
+            .ServeScripted(stalled, await Png(Bgra.Green), BodyScript.StallAcquisition())
+            .Serve(next, await Png(Bgra.Red));
+        await using var scope = new ManagerScope(handler, Idle, maxConcurrentDownloads: 1);
+
+        var expired = await scope.LoadOriginalAsync(stalled);
+        Assert.IsNull(expired.Image, "The stalled original acquisition did not fail.");
+        Assert.IsFalse(scope.TemporaryOriginalFiles().Any(), "Acquisition expiry left a temporary original file.");
+
+        var cached = await scope.LoadAsync(next);
+        ImageFixtures.AssertColor(ImageFixtures.AssertRaster(cached.Image, Size, Size, "cached after acquisition expiry"), Bgra.Red, "cached after acquisition expiry");
+        var original = await scope.LoadOriginalAsync(next);
+        ImageFixtures.AssertColor(ImageFixtures.AssertRaster(original.Image, Size, Size, "original after acquisition expiry"), Bgra.Red, "original after acquisition expiry");
+    }
+
     // Criterion 8: an original body that ends early leaves no partial temporary file.
     // Each stalled script observes the temporary file from inside its pending read. Production cannot settle
     // that read, or delete the file, while the observation runs, so the precondition does not race cleanup.

@@ -59,7 +59,7 @@ internal sealed partial class ImageExCacheManager
             await _downloadConcurrency.WaitAsync(operationToken).ConfigureAwait(false);
             try
             {
-                // Response headers and each body read have separate timeout budgets.
+                // Response headers, stream acquisition, and each body read have separate timeout budgets.
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(operationToken);
                 deadline.CancelAfter(TimeSpan.FromSeconds(30));
                 operationToken.ThrowIfCancellationRequested();
@@ -76,10 +76,10 @@ internal sealed partial class ImageExCacheManager
                 var destination = _diskCache.GetFilePath(key, extension);
                 Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
                 temporaryPath = destination + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                await using var source = await response.Content.ReadAsStreamAsync(deadline.Token).ConfigureAwait(false);
+                deadline.CancelAfter(Timeout.InfiniteTimeSpan);
+                await using var source = await OpenSourceStreamAsync(response.Content, _bodyIdleTimeout, operationToken).ConfigureAwait(false);
                 await using var file = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write,
                     FileShare.None, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                deadline.CancelAfter(Timeout.InfiniteTimeSpan);
                 size = await CopyOriginalSourceAsync(source, file, sourceLimit, operationToken, _bodyIdleTimeout).ConfigureAwait(false);
                 if (size == 0) throw new IOException("Original image is empty.");
                 RecordDownloadCompleted(uri, checked((int)size));

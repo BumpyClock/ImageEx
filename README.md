@@ -33,7 +33,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 Decoded memory entries remain separate for cached and original candidates, even with the same URI and decode dimensions.
 Managed image downloads allow 30 seconds for response headers.
 Each pending body read has a separate 30-second idle timeout. The timeout restarts for every read.
-Opening the body stream also has a 30-second timeout. For original downloads, this budget is shared with the response headers.
+Opening the body stream also has a separate 30-second idle timeout, including original downloads.
 Destination writes, decoding, and queueing for a download slot do not count against these timeouts.
 A transfer can exceed 30 seconds in total if each read completes within its timeout. There is no limit on the total transfer duration.
 Cached downloads make up to three attempts when the headers or the body time out. The delays between attempts are 200 ms and 400 ms.
