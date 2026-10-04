@@ -14,6 +14,8 @@ internal sealed class BodyScript
     private readonly CancellationTokenSource _abort = new();
     private readonly TaskCompletionSource _stalled = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _canceled = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _disposed = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private BodyScript()
     {
@@ -30,6 +32,8 @@ internal sealed class BodyScript
 
     public bool IsGated { get; private init; }
 
+    public bool HoldsCancellation { get; private init; }
+
     public Action? OnStall { get; private init; }
 
     public TimeSpan ReadDelay { get; private init; }
@@ -38,6 +42,8 @@ internal sealed class BodyScript
 
     /// <summary>Completes when the body first stalls or first waits at its gate.</summary>
     public Task Stalled => _stalled.Task;
+
+    public Task Disposed => _disposed.Task;
 
     public static BodyScript Complete() => new();
 
@@ -52,9 +58,16 @@ internal sealed class BodyScript
     /// <summary>The first read waits until the test releases the body, then the whole body arrives.</summary>
     public static BodyScript Gated() => new() { IsGated = true };
 
+    /// <summary>Holds a canceled read until Release, so disposal must wait for transport cleanup.</summary>
+    public static BodyScript HoldCanceledRead() => new() { StallAfterBytes = 0, HoldsCancellation = true };
+
     public Task WaitUntilStalledAsync() => TestWait.ForTaskAsync(Stalled, "the response body to stall after its headers");
 
+    public Task WaitUntilCanceledAsync() => TestWait.ForTaskAsync(_canceled.Task, "the response body to observe cancellation");
+
     public void Release() => _released.TrySetResult();
+
+    internal void MarkDisposed() => _disposed.TrySetResult();
 
     /// <summary>Ends every stalled wait of every script with an IOException, so a failing test can still dispose its manager.</summary>
     public static void AbortAll()
@@ -78,6 +91,12 @@ internal sealed class BodyScript
         catch (OperationCanceledException) when (_abort.IsCancellationRequested && !token.IsCancellationRequested)
         {
             throw new IOException("The test aborted a stalled body.");
+        }
+        catch (OperationCanceledException) when (HoldsCancellation && token.IsCancellationRequested)
+        {
+            _canceled.TrySetResult();
+            await _released.Task.ConfigureAwait(false);
+            throw;
         }
         catch (OperationCanceledException) when (ReportsIOException)
         {
@@ -158,4 +177,10 @@ internal sealed class ScriptedStream(byte[] body, BodyScript script) : Stream
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) script.MarkDisposed();
+        base.Dispose(disposing);
+    }
 }

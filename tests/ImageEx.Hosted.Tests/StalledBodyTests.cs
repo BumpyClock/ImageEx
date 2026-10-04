@@ -229,6 +229,56 @@ public sealed class StalledBodyTests
         ImageFixtures.AssertColor(ImageFixtures.AssertRaster(unrelated.Image, Size, Size, "other URL"), Bgra.Blue, "other URL");
     }
 
+    [UITestMethod]
+    public Task Disposal_waits_for_the_last_waiters_canceled_download()
+        => AssertDisposalWaitsForCanceledDownloadsAsync(1);
+
+    [UITestMethod]
+    public Task Disposal_waits_for_every_canceled_download()
+        => AssertDisposalWaitsForCanceledDownloadsAsync(2);
+
+    private static async Task AssertDisposalWaitsForCanceledDownloadsAsync(int downloadCount)
+    {
+        var handler = new FixtureHandler();
+        var bodies = Enumerable.Range(0, downloadCount).Select(_ => BodyScript.HoldCanceledRead()).ToArray();
+        var uris = Enumerable.Range(0, downloadCount).Select(_ => TestUris.Next("canceled-disposal.png")).ToArray();
+        var png = await Png(Bgra.Red);
+        for (var i = 0; i < downloadCount; i++) handler.ServeScripted(uris[i], png, bodies[i]);
+        await using var scope = new ManagerScope(handler, bodyIdleTimeout: null, maxConcurrentDownloads: downloadCount);
+        using var cancellation = new CancellationTokenSource();
+        var loads = uris.Select(uri => scope.Manager.GetOrLoadImageAsync(uri, Size, Size, DecodePixelType.Physical,
+            cancellation.Token, scope.Dispatcher)).ToArray();
+
+        foreach (var body in bodies) await body.WaitUntilStalledAsync();
+        cancellation.Cancel();
+        foreach (var body in bodies) await body.WaitUntilCanceledAsync();
+        foreach (var load in loads)
+        {
+            await TestWait.ForTaskAsync(load, "the final canceled waiter to settle");
+            await Assert.ThrowsAsync<OperationCanceledException>(() => load);
+        }
+
+        var disposal = scope.Manager.DisposeAsync().AsTask();
+        try
+        {
+            for (var i = 0; i < downloadCount; i++)
+            {
+                await Task.WhenAny(disposal, Task.Delay(100));
+                Assert.IsFalse(disposal.IsCompleted, "The manager disposed while a canceled transport still owned its download slot.");
+                bodies[i].Release();
+                await TestWait.ForTaskAsync(bodies[i].Disposed, "the canceled source stream to be disposed");
+                await bodies[i].Disposed;
+            }
+
+            await TestWait.ForTaskAsync(disposal, "manager disposal after every canceled transport finishes");
+            await disposal;
+        }
+        finally
+        {
+            foreach (var body in bodies) body.Release();
+        }
+    }
+
     // Criterion 7: replacement and unload during a stalled body keep late completions off the control.
     [UITestMethod]
     public async Task Replacement_during_a_stalled_body_keeps_the_replacement()

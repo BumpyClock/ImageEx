@@ -726,18 +726,33 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
     private SharedDownload StartSharedDownload(string cacheKey, Uri uri, Lazy<SharedDownload>? lazyDownload)
     {
+        lock (_lifetimeGate)
+        {
+            // The accepted caller keeps disposal open while its child download is registered.
+            _activeOperations++;
+        }
+
         var sharedDownload = new SharedDownload(token => DownloadAsync(uri, token));
         _ = sharedDownload.Task.ContinueWith(
-            static (_, state) =>
+            static (completed, state) =>
             {
                 var (manager, key, lazy, shared) =
                     ((ImageExCacheManager Manager, string Key, Lazy<SharedDownload>? Lazy, SharedDownload Shared))state!;
-                if (lazy != null)
+                try
                 {
-                    manager.RemoveSharedDownload(key, lazy);
-                }
+                    // Every waiter can leave before a failed transport finishes.
+                    _ = completed.Exception;
+                    if (lazy != null)
+                    {
+                        manager.RemoveSharedDownload(key, lazy);
+                    }
 
-                shared.Dispose();
+                    shared.Dispose();
+                }
+                finally
+                {
+                    manager.EndOperation();
+                }
             },
             (Manager: this, Key: cacheKey, Lazy: lazyDownload, Shared: sharedDownload),
             CancellationToken.None,
@@ -2044,22 +2059,6 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     {
         await operationsDrained.ConfigureAwait(false);
         _originalShutdown.Dispose();
-        var activeDownloads = _inFlightDownloads.Values
-            .Where(download => download.IsValueCreated)
-            .Select(download => download.Value.Task)
-            .ToArray();
-        if (activeDownloads.Length > 0)
-        {
-            try
-            {
-                await Task.WhenAll(activeDownloads).ConfigureAwait(false);
-            }
-            catch
-            {
-                // HttpClient disposal cancels active downloads before metadata flush.
-            }
-        }
-
         await _diskCache.FlushMetadataAsync().ConfigureAwait(false);
         await _diskCache.DisposeAsync().ConfigureAwait(false);
         _cleanupLock.Dispose();
