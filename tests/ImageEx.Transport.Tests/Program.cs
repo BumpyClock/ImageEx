@@ -92,7 +92,7 @@ await AssertUncachedLoadSucceeds("Uncached load succeeds after stalled mid-body 
 
 await CopyTests.RunAsync();
 var idleScenarios = await IdleTimeoutTests.RunAsync();
-Console.WriteLine($"Passed 17 uncached transport scenarios, 5 copy scenarios, and {idleScenarios} idle timeout scenarios. WinUI decode is stubbed.");
+Console.WriteLine($"Passed 17 uncached transport scenarios, 6 copy scenarios, and {idleScenarios} idle timeout scenarios. WinUI decode is stubbed.");
 
 static Task<ImageExCacheManager.CacheResult> Resolve(ImageRequestMode mode, HttpClient client, CancellationToken token = default,
     TimeSpan? bodyIdleTimeout = null)

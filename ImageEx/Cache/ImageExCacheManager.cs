@@ -62,6 +62,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private const int MaxSmallDecodedImageCacheDimension = 512;
     private const int MaxRecentDownloadFailures = 1024;
     private static readonly TimeSpan DownloadFailureBackoff = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan TransientDownloadFailureBackoff = TimeSpan.FromSeconds(5);
     private readonly object _smallDecodedImageCacheLock = new();
     private readonly Dictionary<string, SmallDecodedImageCacheEntry> _smallDecodedImageCache = new();
     private readonly LinkedList<string> _smallDecodedImageCacheLru = new();
@@ -89,7 +90,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private static long _telemetryPeakActiveDecodeCount;
 
     private sealed record SmallDecodedImageCacheEntry(ImageSource Image, LinkedListNode<string> LruNode, long SizeBytes);
-    private readonly record struct DownloadFailure(string CacheKey, long Timestamp);
+    private readonly record struct DownloadFailure(string CacheKey, long Timestamp, TimeSpan Backoff);
 
     private sealed class CacheWriteLock : IDisposable
     {
@@ -164,7 +165,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         public ReadOnlyMemory<byte> Memory => Buffer.AsMemory(0, Length);
     }
 
-    private readonly record struct DownloadResult(DownloadedBytes? Bytes, string? ContentType);
+    private readonly record struct DownloadResult(DownloadedBytes? Bytes, string? ContentType, TimeSpan? FailureBackoff = null);
 
     private sealed class ImageSourceTooLargeException(long observedBytes, long maximumBytes)
         : Exception($"Image source response exceeded {maximumBytes} bytes after {observedBytes} bytes.");
@@ -362,9 +363,9 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
         if (result.Bytes == null || token.IsCancellationRequested)
         {
-            if (!token.IsCancellationRequested)
+            if (!token.IsCancellationRequested && result.FailureBackoff is { } backoff)
             {
-                RememberDownloadFailure(cacheKey);
+                RememberDownloadFailure(cacheKey, backoff);
             }
 
             return new CacheResult(null, false);
@@ -665,7 +666,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         }
     }
 
-    private void RememberDownloadFailure(string cacheKey)
+    private void RememberDownloadFailure(string cacheKey, TimeSpan? backoff = null)
     {
         lock (_downloadFailuresGate)
         {
@@ -683,7 +684,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
             _recentDownloadFailures.Add(
                 cacheKey,
-                _downloadFailureOrder.AddLast(new DownloadFailure(cacheKey, now)));
+                _downloadFailureOrder.AddLast(new DownloadFailure(cacheKey, now, backoff ?? DownloadFailureBackoff)));
         }
     }
 
@@ -698,13 +699,19 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         }
     }
 
-    // The gate protects both indexes. Monotonic failure order permits prefix-only expiry without a timer.
+    // Mixed backoffs can expire out of insertion order. The gate protects both bounded indexes.
     private void RemoveExpiredDownloadFailures(long now)
     {
-        while (_downloadFailureOrder.First is { } oldest &&
-            _timeProvider.GetElapsedTime(oldest.Value.Timestamp, now) >= DownloadFailureBackoff)
+        var node = _downloadFailureOrder.First;
+        while (node != null)
         {
-            RemoveOldestDownloadFailure();
+            var next = node.Next;
+            if (_timeProvider.GetElapsedTime(node.Value.Timestamp, now) >= node.Value.Backoff)
+            {
+                _recentDownloadFailures.Remove(node.Value.CacheKey);
+                _downloadFailureOrder.Remove(node);
+            }
+            node = next;
         }
     }
 
@@ -795,16 +802,19 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 {
                     Debug.WriteLine($"[ImageExCache] Rejected oversized image source {uri.Host}: {ex.Message}");
                     RecordDownloadFailed(uri);
-                    return new DownloadResult(null, null);
+                    return new DownloadResult(null, null, DownloadFailureBackoff);
                 }
-                catch (HttpRequestException ex) when (IsTransientError(ex) && attempt < maxAttempts - 1)
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
                 {
-                    var delayMs = baseDelayMs * (1 << attempt); // Exponential: 200ms, 400ms, 800ms
-                    await Task.Delay(delayMs, token).ConfigureAwait(false);
+                    throw;
                 }
-                catch (TaskCanceledException) when (!token.IsCancellationRequested && attempt < maxAttempts - 1)
+                catch (Exception ex) when (IsTransientDownloadError(ex))
                 {
-                    // Header timeout or body idle timeout, not shared-download cancellation.
+                    if (attempt == maxAttempts - 1)
+                    {
+                        RecordDownloadFailed(uri);
+                        return new DownloadResult(null, null, TransientDownloadFailureBackoff);
+                    }
                     var delayMs = baseDelayMs * (1 << attempt);
                     await Task.Delay(delayMs, token).ConfigureAwait(false);
                 }
@@ -812,7 +822,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 {
                     // Return after a permanent failure or the last attempt.
                     RecordDownloadFailed(uri);
-                    return new DownloadResult(null, null);
+                    return new DownloadResult(null, null, DownloadFailureBackoff);
                 }
             }
 
@@ -1002,19 +1012,13 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         var statusCode = ex.StatusCode;
         if (statusCode == null) return true; // Network errors without status code
 
-        // Retry transient errors
-        return statusCode switch
-        {
-            System.Net.HttpStatusCode.RequestTimeout or       // 408
-            System.Net.HttpStatusCode.TooManyRequests or      // 429
-            System.Net.HttpStatusCode.InternalServerError or  // 500
-            System.Net.HttpStatusCode.BadGateway or           // 502
-            System.Net.HttpStatusCode.ServiceUnavailable or   // 503
-            System.Net.HttpStatusCode.GatewayTimeout          // 504
-                => true,
-            _ => false
-        };
+        return statusCode is System.Net.HttpStatusCode.RequestTimeout or System.Net.HttpStatusCode.TooManyRequests
+            || (int)statusCode >= 500 && (int)statusCode <= 599;
     }
+
+    private static bool IsTransientDownloadError(Exception error) =>
+        error is HttpRequestException requestError && IsTransientError(requestError)
+        || error is OperationCanceledException;
 
     private async Task<ImageSource?> LoadFromFileAsync(
         string filePath,

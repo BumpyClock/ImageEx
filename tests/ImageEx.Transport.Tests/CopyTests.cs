@@ -22,6 +22,19 @@ internal static class CopyTests
         }
         await ExpectFailure<IOException>(new MemoryStream(new byte[13]),
             12, CancellationToken.None, TimeSpan.FromSeconds(1), "source byte limit");
+        using (var source = new MemoryStream(new byte[1]))
+        using (var destination = new FailingDestination())
+        {
+            try
+            {
+                await ImageExCacheManager.CopyOriginalSourceAsync(source, destination, 12, CancellationToken.None);
+                throw new Exception("FAIL: destination IO failure must propagate.");
+            }
+            catch (IOException error) when (ReferenceEquals(error, destination.Failure))
+            {
+                Console.WriteLine("PASS: destination IO failure remains a storage failure");
+            }
+        }
         using (var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(50)))
         {
             await ExpectFailure<OperationCanceledException>(new DelayedStream(new byte[1], Timeout.InfiniteTimeSpan),
@@ -54,5 +67,12 @@ internal static class CopyTests
             }
         }
         throw new Exception("FAIL: " + name);
+    }
+
+    private sealed class FailingDestination : MemoryStream
+    {
+        internal IOException Failure { get; } = new("Destination write failed.");
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
+            ValueTask.FromException(Failure);
     }
 }

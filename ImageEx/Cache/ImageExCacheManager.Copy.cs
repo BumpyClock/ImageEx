@@ -95,6 +95,8 @@ internal sealed partial class ImageExCacheManager
         return deadlineCanceled
             ? new TaskCanceledException("Image source body made no progress within the idle timeout.",
                 new TimeoutException("Image source body idle timeout elapsed.", error), deadline.Token)
-            : null;
+            : error is IOException
+                ? new HttpRequestException("Image source body transport failed.", error)
+                : null;
     }
 }
