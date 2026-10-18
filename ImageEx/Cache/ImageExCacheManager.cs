@@ -780,14 +780,14 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         const int maxAttempts = 3;
         const int baseDelayMs = 200;
 
-        await _downloadConcurrency.WaitAsync(token).ConfigureAwait(false);
-        try
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            RecordDownloadStarted(uri);
-            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            try
             {
+                await _downloadConcurrency.WaitAsync(token).ConfigureAwait(false);
                 try
                 {
+                    if (attempt == 0) RecordDownloadStarted(uri);
                     using var response = await _httpClient.GetAsync(
                         uri,
                         HttpCompletionOption.ResponseHeadersRead,
@@ -798,41 +798,40 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                     RecordDownloadCompleted(uri, bytes.Length);
                     return new DownloadResult(bytes, contentType);
                 }
-                catch (ImageSourceTooLargeException ex)
+                finally
                 {
-                    Debug.WriteLine($"[ImageExCache] Rejected oversized image source {uri.Host}: {ex.Message}");
-                    RecordDownloadFailed(uri);
-                    return new DownloadResult(null, null, DownloadFailureBackoff);
-                }
-                catch (OperationCanceledException) when (token.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception ex) when (IsTransientDownloadError(ex))
-                {
-                    if (attempt == maxAttempts - 1)
-                    {
-                        RecordDownloadFailed(uri);
-                        return new DownloadResult(null, null, TransientDownloadFailureBackoff);
-                    }
-                    var delayMs = baseDelayMs * (1 << attempt);
-                    await Task.Delay(delayMs, token).ConfigureAwait(false);
-                }
-                catch
-                {
-                    // Return after a permanent failure or the last attempt.
-                    RecordDownloadFailed(uri);
-                    return new DownloadResult(null, null, DownloadFailureBackoff);
+                    _downloadConcurrency.Release();
                 }
             }
+            catch (ImageSourceTooLargeException ex)
+            {
+                Debug.WriteLine($"[ImageExCache] Rejected oversized image source {uri.Host}: {ex.Message}");
+                RecordDownloadFailed(uri);
+                return new DownloadResult(null, null, DownloadFailureBackoff);
+            }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex) when (IsTransientDownloadError(ex))
+            {
+                if (attempt == maxAttempts - 1)
+                {
+                    RecordDownloadFailed(uri);
+                    return new DownloadResult(null, null, TransientDownloadFailureBackoff);
+                }
+                var delayMs = baseDelayMs * (1 << attempt);
+                await Task.Delay(delayMs, token).ConfigureAwait(false);
+            }
+            catch
+            {
+                RecordDownloadFailed(uri);
+                return new DownloadResult(null, null, DownloadFailureBackoff);
+            }
+        }
 
-            RecordDownloadFailed(uri);
-            return new DownloadResult(null, null);
-        }
-        finally
-        {
-            _downloadConcurrency.Release();
-        }
+        RecordDownloadFailed(uri);
+        return new DownloadResult(null, null);
     }
 
     internal async Task<DownloadedBytes> ReadBoundedContentAsync(
@@ -1009,6 +1008,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
     private static bool IsTransientError(HttpRequestException ex)
     {
+        if (ex.HttpRequestError == HttpRequestError.SecureConnectionError) return false;
+
         var statusCode = ex.StatusCode;
         if (statusCode == null) return true; // Network errors without status code
 
