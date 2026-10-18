@@ -130,7 +130,8 @@ internal sealed partial class ImageExCacheManager
             var reason = error is OperationCanceledException ? "timeout-or-shutdown" : "download-cache-or-decode";
             var status = error is HttpRequestException requestError ? requestError.StatusCode?.ToString() : null;
             Debug.WriteLine($"[ImageEx] original-fallback failed host={uri.Host} type={error.GetType().Name} reason={reason} status={status} hresult={error.HResult}");
-            if (!_originalShutdown.IsCancellationRequested) RememberDownloadFailure(key);
+            if (!token.IsCancellationRequested && !_originalShutdown.IsCancellationRequested)
+                RememberDownloadFailure(key, IsTransientDownloadError(error) ? TransientDownloadFailureBackoff : DownloadFailureBackoff);
             return new CacheResult(null, false);
         }
         finally

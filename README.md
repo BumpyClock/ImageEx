@@ -38,10 +38,10 @@ Destination writes, decoding, and queueing for a download slot do not count agai
 A transfer can exceed 30 seconds in total if each read completes within its timeout. There is no limit on the total transfer duration.
 Cached downloads make up to three attempts when the headers or the body time out. The delays between attempts are 200 ms and 400 ms.
 A body operation counts as timed out when its idle timeout fires, whatever error the stream then reports.
-Network errors without an HTTP status also retry. Other body errors end the load without another attempt.
-After the last attempt, the load fails and the URL enters the ten-minute failure backoff.
-A cached download keeps its download slot through all attempts and both delays.
-A thumbnail body that stalls on every attempt holds its slot for about three idle timeouts plus the delays. At the default timeout, that is about 90.6 seconds. The load then fails and releases the slot.
+Network errors without an HTTP status also retry, including body read IO failures. TLS handshake failures do not retry.
+Transient failures enter a five-second failure backoff after attempts end. Permanent failures, including TLS handshake failures, retain the ten-minute backoff.
+A cached download releases its slot after each attempt and waits outside the slot between attempts. Each retry queues for a slot again, allowing other waiting downloads to proceed.
+A thumbnail that stalls on every attempt can take three idle timeouts plus delays and queue waits to fail, but it does not reserve a slot across those attempts.
 Original downloads and downloads with `EnableDiskCache = false` make one attempt.
 In an ordered request, a candidate that fails or times out advances to the next candidate.
 A download releases its download slot when it succeeds, fails, times out, or is canceled, so a stalled body cannot hold a slot indefinitely.
