@@ -349,10 +349,13 @@ namespace ImageEx
 
         private void ApplyLazyLoadingViewportState(bool isInViewport)
         {
-            var generation = Interlocked.Increment(ref _viewportStateGeneration);
+            // Repeated offscreen geometry updates belong to the same grace period.
+            var generation = _isInViewport == isInViewport
+                ? Interlocked.Read(ref _viewportStateGeneration)
+                : Interlocked.Increment(ref _viewportStateGeneration);
+            _isInViewport = isInViewport;
             if (isInViewport)
             {
-                _isInViewport = true;
                 CancelPendingOffscreenDetach();
 
                 if (_lazyLoadingSource != null)
@@ -372,7 +375,6 @@ namespace ImageEx
             }
             else
             {
-                _isInViewport = false;
                 if (HasAttachedSource())
                 {
                     ImageExDiagnostics.RecordOffscreenAttached(this);
@@ -391,7 +393,11 @@ namespace ImageEx
 
         private void ScheduleOffscreenDetach(long generation)
         {
-            CancelPendingOffscreenDetach();
+            if (_offscreenDetachTokenSource != null)
+            {
+                return;
+            }
+
             var tokenSource = new CancellationTokenSource();
             _offscreenDetachTokenSource = tokenSource;
             _ = DetachSourceAfterGracePeriodAsync(generation, tokenSource);
