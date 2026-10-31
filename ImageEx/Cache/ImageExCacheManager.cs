@@ -374,7 +374,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         ForgetDownloadFailure(cacheKey);
 
         // Detect SVG from content-type if URL didn't have .svg extension
-        var detectedSvg = isSvg || result.ContentType == "image/svg+xml";
+        var detectedSvg = isSvg || string.Equals(result.ContentType, "image/svg+xml", StringComparison.OrdinalIgnoreCase);
         var extension = ImageExDiskCache.GetExtension(uri, result.ContentType, detectedSvg);
         var newFilePath = _diskCache.GetFilePath(cacheKey, extension);
 
