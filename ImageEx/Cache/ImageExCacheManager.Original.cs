@@ -31,11 +31,18 @@ internal sealed partial class ImageExCacheManager
             RecordImageRequest(uri, decodeWidth, decodeHeight, decodeType);
 
             await _diskCache.EnsureMetadataLoadedAsync().ConfigureAwait(false);
+            operationToken.ThrowIfCancellationRequested();
+            var uriIsSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase);
+            if (TryGetSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, uriIsSvg, dpiScale, out var decoded, ImageRequestMode.Original))
+            {
+                _diskCache.UpdateAccessTime(key);
+                RecordCacheHit(uri, 0, decodeWidth, decodeHeight, decodeType);
+                return new CacheResult(decoded, true);
+            }
             sourceLock = RentCacheWriteLock(key);
             await sourceLock.Semaphore.WaitAsync(operationToken).ConfigureAwait(false);
             entered = true;
-            var uriIsSvg = uri.AbsolutePath.EndsWith(".svg", StringComparison.OrdinalIgnoreCase);
-            if (TryGetSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, uriIsSvg, dpiScale, out var decoded, ImageRequestMode.Original))
+            if (TryGetSmallDecodedImage(uri, decodeWidth, decodeHeight, decodeType, uriIsSvg, dpiScale, out decoded, ImageRequestMode.Original))
             {
                 _diskCache.UpdateAccessTime(key);
                 RecordCacheHit(uri, 0, decodeWidth, decodeHeight, decodeType);
@@ -116,9 +123,10 @@ internal sealed partial class ImageExCacheManager
                 DownloadedUtc = DateTimeOffset.UtcNow, LastAccessUtc = DateTimeOffset.UtcNow
             });
             ForgetDownloadFailure(key);
-            await StoreSmallDecodedImageAsync(uri, decodeWidth, decodeHeight, decodeType,
-                isSvg, dpiScale, image, dispatcherQueue, ImageRequestMode.Original).ConfigureAwait(false);
-            await EnforceCleanupIfNeededAsync().ConfigureAwait(false);
+            var decodedCache = StoreSmallDecodedImageAsync(uri, decodeWidth, decodeHeight, decodeType,
+                isSvg, dpiScale, image, dispatcherQueue, ImageRequestMode.Original);
+            var cleanup = EnforceCleanupIfNeededAsync();
+            await Task.WhenAll(decodedCache, cleanup).ConfigureAwait(false);
             return new CacheResult(image, false);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)

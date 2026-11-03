@@ -25,6 +25,7 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
     private readonly SemaphoreSlim _metadataSignal = new(0, 1);
     private readonly object _writerGate = new();
     private readonly Func<IReadOnlyDictionary<string, CacheEntry>, CancellationToken, Task> _metadataWriter;
+    private readonly Func<string, ReadOnlyMemory<byte>, CancellationToken, Task> _fileWriter;
     private readonly TimeSpan _metadataDebounce;
     private readonly TimeSpan _metadataMaximumDelay;
     private Task _writerTask = Task.CompletedTask;
@@ -43,13 +44,26 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
         string cacheDirectory,
         Func<IReadOnlyDictionary<string, CacheEntry>, CancellationToken, Task>? metadataWriter = null,
         TimeSpan? metadataDebounce = null,
-        TimeSpan? metadataMaximumDelay = null)
+        TimeSpan? metadataMaximumDelay = null,
+        Func<string, ReadOnlyMemory<byte>, CancellationToken, Task>? fileWriter = null)
     {
         _cacheDir = cacheDirectory;
         _metadataPath = Path.Combine(_cacheDir, ImageExCacheConstants.MetadataFileName);
         _metadataWriter = metadataWriter ?? WriteMetadataFileAsync;
+        _fileWriter = fileWriter ?? WriteCacheFileAsync;
         _metadataDebounce = metadataDebounce ?? DefaultMetadataDebounce;
         _metadataMaximumDelay = metadataMaximumDelay ?? DefaultMetadataMaximumDelay;
+    }
+
+    internal Task WriteFileAsync(string path, ReadOnlyMemory<byte> bytes, CancellationToken token)
+        => _fileWriter(path, bytes, token);
+
+    private static async Task WriteCacheFileAsync(string path, ReadOnlyMemory<byte> bytes, CancellationToken token)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await using var stream = new FileStream(path, FileMode.Create, FileAccess.Write,
+            FileShare.None, bufferSize: 64 * 1024, useAsync: true);
+        await stream.WriteAsync(bytes, token).ConfigureAwait(false);
     }
 
     /// <summary>
