@@ -44,6 +44,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     private readonly SemaphoreSlim _cleanupLock = new(1, 1);
     private readonly SemaphoreSlim _downloadConcurrency;
     private readonly SemaphoreSlim _decodeConcurrency;
+    private readonly SemaphoreSlim _decodePersistenceConcurrency;
     private readonly object _lifetimeGate = new();
     private readonly long _maximumSourceBytes;
     private readonly TimeSpan _bodyIdleTimeout;
@@ -126,12 +127,13 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         int maxConcurrentDecodes = 2,
         long maximumSourceBytes = ImageExCacheConstants.DefaultMaximumSourceBytes,
         TimeProvider? timeProvider = null,
-        TimeSpan? bodyIdleTimeout = null)
+        TimeSpan? bodyIdleTimeout = null,
+        ImageExDiskCache? diskCache = null)
     {
         _bodyIdleTimeout = bodyIdleTimeout ?? ImageExCacheConstants.SourceIdleTimeout;
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(_bodyIdleTimeout, TimeSpan.Zero, nameof(bodyIdleTimeout));
         _timeProvider = timeProvider ?? TimeProvider.System;
-        _diskCache = new ImageExDiskCache(cacheDirectory);
+        _diskCache = diskCache ?? new ImageExDiskCache(cacheDirectory);
         _httpClient = httpMessageHandler == null
             ? new HttpClient { Timeout = TimeSpan.FromSeconds(30) }
             : new HttpClient(httpMessageHandler) { Timeout = TimeSpan.FromSeconds(30) };
@@ -139,6 +141,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         maxConcurrentDecodes = Math.Max(1, maxConcurrentDecodes);
         _downloadConcurrency = new SemaphoreSlim(maxConcurrentDownloads, maxConcurrentDownloads);
         _decodeConcurrency = new SemaphoreSlim(maxConcurrentDecodes, maxConcurrentDecodes);
+        _decodePersistenceConcurrency = new SemaphoreSlim(maxConcurrentDecodes, maxConcurrentDecodes);
         _maximumSourceBytes = Math.Clamp(maximumSourceBytes, 1, int.MaxValue);
     }
 
@@ -158,7 +161,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         long CacheWriteLockRemovals,
         int DiskCacheEntryCount,
         long DiskCacheBytes,
-        int RecentDownloadFailures);
+        int RecentDownloadFailures,
+        long ProcessDecodeSuccesses = 0);
 
     internal sealed record DownloadedBytes(byte[] Buffer, int Length)
     {
@@ -284,7 +288,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             Interlocked.Read(ref _telemetryCacheWriteLockRemovalCount),
             diskEntries.Length,
             diskEntries.Sum(entry => entry.Value.SizeBytes),
-            recentDownloadFailures);
+            recentDownloadFailures,
+            Interlocked.Read(ref _telemetryDecodeSuccessCount));
     }
 
     /// <summary>
@@ -378,32 +383,40 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         var extension = ImageExDiskCache.GetExtension(uri, result.ContentType, detectedSvg);
         var newFilePath = _diskCache.GetFilePath(cacheKey, extension);
 
-        // 3. Save to disk
+        if (token.IsCancellationRequested)
+        {
+            return CancelledResult(token, returnNullOnCancellation);
+        }
+
+        ImageSource? loadedImage;
+        // Bound decoded images retained behind slow writes. Excess loads keep disk-first order.
+        var overlap = _decodePersistenceConcurrency.Wait(0);
         try
         {
+            // Separate readers of immutable downloaded bytes can persist and decode together.
+            var persistence = PersistAsync();
+            var decode = overlap
+                ? LoadFromBytesAsync(result.Bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation)
+                : null;
+            if (decode != null)
+            {
+                // Drain both branches, then preserve disk cancellation precedence over decode failures.
+                await Task.WhenAll(persistence, decode).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+            }
+            if (!await persistence.ConfigureAwait(false))
+            {
+                return new CacheResult(null, false);
+            }
             if (token.IsCancellationRequested)
             {
                 return CancelledResult(token, returnNullOnCancellation);
             }
-
-            await SaveDownloadedFileAsync(cacheKey, uri, newFilePath, extension, result.Bytes.Memory, token, returnNullOnCancellation).ConfigureAwait(false);
-            await EnforceCleanupIfNeededAsync().ConfigureAwait(false);
+            loadedImage = await (decode ?? LoadFromBytesAsync(result.Bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation)).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (!returnNullOnCancellation)
+        finally
         {
-            throw;
+            if (overlap) _decodePersistenceConcurrency.Release();
         }
-        catch (OperationCanceledException)
-        {
-            return new CacheResult(null, false);
-        }
-        catch
-        {
-            // The disk save failed. Return the image from memory.
-        }
-
-        // Return an image from the downloaded bytes.
-        var loadedImage = await LoadFromBytesAsync(result.Bytes, detectedSvg, decodeWidth, decodeHeight, decodeType, dispatcherQueue, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
         if (loadedImage != null)
         {
             await StoreSmallDecodedImageAsync(
@@ -422,6 +435,29 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         }
 
             return new CacheResult(loadedImage, WasCacheHit: false);
+
+        async Task<bool> PersistAsync()
+        {
+            try
+            {
+                await SaveDownloadedFileAsync(cacheKey, uri, newFilePath, extension, result.Bytes.Memory, token, returnNullOnCancellation).ConfigureAwait(false);
+                await EnforceCleanupIfNeededAsync().ConfigureAwait(false);
+                return true;
+            }
+            catch (OperationCanceledException) when (!returnNullOnCancellation)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            catch
+            {
+                // Disk failures do not prevent displaying the downloaded image.
+                return true;
+            }
+        }
         }
         finally
         {
@@ -932,19 +968,8 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 }
             }
 
-            Directory.CreateDirectory(Path.GetDirectoryName(filePath)!);
-            await using (var fileStream = new FileStream(
-                filePath,
-                FileMode.Create,
-                FileAccess.Write,
-                FileShare.None,
-                bufferSize: 64 * 1024,
-                useAsync: true))
-            {
-                await fileStream.WriteAsync(
-                    bytes,
-                    returnNullOnCancellation ? CancellationToken.None : token).ConfigureAwait(false);
-            }
+            await _diskCache.WriteFileAsync(filePath, bytes,
+                returnNullOnCancellation ? CancellationToken.None : token).ConfigureAwait(false);
 
             _diskCache.AddOrUpdateEntry(cacheKey, new CacheEntry
             {
@@ -1192,19 +1217,18 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         }
 
         using var bitmapStream = stream.AsRandomAccessStream();
-        var dimensions = await ResolveDecodeDimensionsAsync(bitmapStream, decodeWidth, decodeHeight, decodeType, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
-        if (dimensions == null)
+        var raster = await CreateRasterDecoderAsync(bitmapStream, decodeWidth, decodeHeight, decodeType, dpiScale, token, returnNullOnCancellation).ConfigureAwait(false);
+        if (raster == null)
         {
             return null;
         }
 
-        if (CanDecodeToWriteableBitmap(dimensions.Value))
+        if (CanDecodeToWriteableBitmap(raster.Value.Dimensions))
         {
-            bitmapStream.Seek(0);
-
             var decodedBitmap = await CreatePrescaledBitmapAsync(
+                raster.Value.Decoder,
                 bitmapStream,
-                dimensions.Value,
+                raster.Value.Dimensions,
                 dispatcherQueue,
                 token,
                 returnNullOnCancellation);
@@ -1228,7 +1252,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             dimensions.NaturalHeight > 0;
     }
 
-    private static async Task<DecodeDimensions?> ResolveDecodeDimensionsAsync(
+    private static async Task<(BitmapDecoder Decoder, DecodeDimensions Dimensions)?> CreateRasterDecoderAsync(
         IRandomAccessStream stream,
         int decodeWidth,
         int decodeHeight,
@@ -1249,20 +1273,18 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
 
         try
         {
-            var decoder = await BitmapDecoder.CreateAsync(stream).AsTask().ConfigureAwait(false);
+            var decoder = await BitmapDecoder.CreateAsync(stream).AsTask(token).ConfigureAwait(false);
             var naturalWidth = decoder.OrientedPixelWidth;
             var naturalHeight = decoder.OrientedPixelHeight;
             if (naturalWidth <= 0 || naturalHeight <= 0)
             {
                 Debug.WriteLine("[ImageExCache] Failed to read natural image size for prescale.");
-                return decodeWidth > 0 || decodeHeight > 0
-                    ? null
-                    : new DecodeDimensions(0, 0, 0, 0);
+                return null;
             }
 
             var (targetWidth, targetHeight) = ResolveRasterDecodeSize(
                 naturalWidth, naturalHeight, decodeWidth, decodeHeight, decodeType, dpiScale);
-            return new DecodeDimensions(targetWidth, targetHeight, naturalWidth, naturalHeight);
+            return (decoder, new DecodeDimensions(targetWidth, targetHeight, naturalWidth, naturalHeight));
         }
         catch (OperationCanceledException) when (returnNullOnCancellation)
         {
@@ -1276,9 +1298,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         catch (Exception ex)
         {
             Debug.WriteLine($"[ImageExCache] Failed to resolve prescale dimensions: {ex.Message}");
-            return decodeWidth > 0 || decodeHeight > 0
-                ? null
-                : new DecodeDimensions(0, 0, 0, 0);
+            return null;
         }
     }
 
@@ -1361,6 +1381,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     }
 
     private static async Task<ImageSource?> CreatePrescaledBitmapAsync(
+        BitmapDecoder decoder,
         IRandomAccessStream sourceStream,
         DecodeDimensions dimensions,
         DispatcherQueue? dispatcherQueue,
@@ -1390,8 +1411,6 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             }
 
             var expectedBytes = checked(dimensions.TargetWidth * dimensions.TargetHeight * 4);
-            stage = "decoder-create";
-            var decoder = await BitmapDecoder.CreateAsync(sourceStream).AsTask().ConfigureAwait(false);
             if (decoder.DecoderInformation.CodecId == BitmapDecoder.GifDecoderId && decoder.FrameCount > 1)
             {
                 return await CreateAnimatedBitmapAsync(sourceStream, dimensions, dispatcherQueue, token)
@@ -1423,7 +1442,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
                 BitmapAlphaMode.Premultiplied,
                 transform,
                 ExifOrientationMode.RespectExifOrientation,
-                ColorManagementMode.DoNotColorManage).AsTask().ConfigureAwait(false);
+                ColorManagementMode.DoNotColorManage).AsTask(token).ConfigureAwait(false);
 
             var pixels = pixelData.DetachPixelData();
             if (pixels.Length != expectedBytes)
@@ -2069,6 +2088,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         _cleanupLock.Dispose();
         _downloadConcurrency.Dispose();
         _decodeConcurrency.Dispose();
+        _decodePersistenceConcurrency.Dispose();
         CacheWriteLock[] writeLocks;
         lock (_cacheWriteLocksGate)
         {
