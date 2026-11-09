@@ -3,6 +3,12 @@ using System.Net.Http.Headers;
 using ImageEx;
 using ImageEx.Cache;
 
+using (var client = ImageExCacheManager.CreateDownloadClient(new IdentifiedClientHandler()))
+{
+    var result = await Resolve(ImageRequestMode.Cached, client);
+    Assert(result.Image?.Bytes == 1024, "Image downloads identify the client to publishers requiring User-Agent");
+}
+
 var cachedLimit = checked((int)ImageExCacheConstants.DefaultMaximumSourceBytes);
 var originalLimit = checked((int)ImageExCacheConstants.MaximumOriginalSourceBytes);
 var cases = new (string Name, ImageRequestMode Mode, int Length, bool Chunked, string MediaType, bool Success)[]
@@ -92,7 +98,7 @@ await AssertUncachedLoadSucceeds("Uncached load succeeds after stalled mid-body 
 
 await CopyTests.RunAsync();
 var idleScenarios = await IdleTimeoutTests.RunAsync();
-Console.WriteLine($"Passed 17 uncached transport scenarios, 6 copy scenarios, and {idleScenarios} idle timeout scenarios. WinUI decode is stubbed.");
+Console.WriteLine($"Passed 18 uncached transport scenarios, 6 copy scenarios, and {idleScenarios} idle timeout scenarios. WinUI decode is stubbed.");
 
 static Task<ImageExCacheManager.CacheResult> Resolve(ImageRequestMode mode, HttpClient client, CancellationToken token = default,
     TimeSpan? bodyIdleTimeout = null)
@@ -131,6 +137,14 @@ sealed class FakeHandler(Func<CancellationToken, Task<HttpResponseMessage>> resp
 {
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         => response(cancellationToken);
+}
+
+sealed class IdentifiedClientHandler : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        => Task.FromResult(request.Headers.UserAgent.Any(product => product.Product?.Name == "ImageEx")
+            ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(new byte[1024]) }
+            : new HttpResponseMessage(HttpStatusCode.Forbidden));
 }
 
 sealed class UnknownLengthContent(byte[] bytes) : HttpContent

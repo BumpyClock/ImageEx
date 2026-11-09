@@ -8,8 +8,17 @@ namespace ImageEx.Cache;
 
 internal sealed partial class ImageExCacheManager
 {
-    private static readonly HttpClient UncachedHttpClient = new() { Timeout = TimeSpan.FromSeconds(30) };
+    private static readonly HttpClient UncachedHttpClient = CreateDownloadClient();
     private static readonly SemaphoreSlim UncachedConcurrency = new(4, 4);
+
+    internal static HttpClient CreateDownloadClient(HttpMessageHandler? handler = null)
+    {
+        var client = handler is null ? new HttpClient() : new HttpClient(handler);
+        client.Timeout = TimeSpan.FromSeconds(30);
+        // Some publishers close image requests that do not identify their client.
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("ImageEx");
+        return client;
+    }
 
     // This path must not create a cache manager or access source files or metadata.
     internal static async Task<CacheResult> GetUncachedImageAsync(
