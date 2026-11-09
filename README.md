@@ -32,6 +32,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 `ImageRequest` tries candidates in order until one succeeds. `ImageRequestMode` selects the source byte limit.
 Decoded memory entries remain separate for cached and original candidates, even with the same URI and decode dimensions.
 Managed image downloads allow 30 seconds for response headers.
+Managed image downloads send an `ImageEx` User-Agent so publishers that require an identified client can serve their images.
 Each pending body read has a separate 30-second idle timeout. The timeout restarts for every read.
 Opening the body stream also has a separate 30-second idle timeout, including original downloads.
 Destination writes, decoding, and queueing for a download slot do not count against these timeouts.

@@ -134,9 +134,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(_bodyIdleTimeout, TimeSpan.Zero, nameof(bodyIdleTimeout));
         _timeProvider = timeProvider ?? TimeProvider.System;
         _diskCache = diskCache ?? new ImageExDiskCache(cacheDirectory);
-        _httpClient = httpMessageHandler == null
-            ? new HttpClient { Timeout = TimeSpan.FromSeconds(30) }
-            : new HttpClient(httpMessageHandler) { Timeout = TimeSpan.FromSeconds(30) };
+        _httpClient = CreateDownloadClient(httpMessageHandler);
         maxConcurrentDownloads = Math.Max(1, maxConcurrentDownloads);
         maxConcurrentDecodes = Math.Max(1, maxConcurrentDecodes);
         _downloadConcurrency = new SemaphoreSlim(maxConcurrentDownloads, maxConcurrentDownloads);
