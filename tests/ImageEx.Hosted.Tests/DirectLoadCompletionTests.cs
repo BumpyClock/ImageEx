@@ -139,6 +139,77 @@ public sealed class DirectLoadCompletionTests
         => AssertUnloadRetiresSilentlyAsync(
             (handler, uri) => handler.ServeGated(uri, Array.Empty<byte>(), status: HttpStatusCode.NotFound));
 
+    [UITestMethod]
+    public async Task Unload_retires_replacement_waiting_for_previous_cancellation()
+    {
+        using var directory = new TempCacheDirectory();
+        var first = TestUris.Next("first.png");
+        var replacement = TestUris.Next("replacement.png");
+        var handler = new FixtureHandler();
+        var route = handler.ServeGated(first, Array.Empty<byte>());
+        await using var manager = new ImageExCacheManager(directory.Path, handler);
+        await using var harness = await ControlHarness.CreateAsync(manager);
+        var cancellationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseCancellation = new ManualResetEventSlim();
+        var replacementCompletion = new SourceChangeContext(SynchronizationContext.Current!);
+        var replacementStarts = 0;
+        harness.Control.ResolveStarted = (uri, token) =>
+        {
+            if (uri == replacement) replacementStarts++;
+            if (uri == first)
+                token.Register(() =>
+                {
+                    cancellationStarted.TrySetResult();
+                    releaseCancellation.Wait(TestWait.DefaultTimeout);
+                });
+        };
+        harness.Control.Source = first;
+        try
+        {
+            await route.WaitUntilStartedAsync();
+            var previousContext = SynchronizationContext.Current;
+            try
+            {
+                SynchronizationContext.SetSynchronizationContext(replacementCompletion);
+                harness.Control.Source = replacement;
+            }
+            finally
+            {
+                SynchronizationContext.SetSynchronizationContext(previousContext);
+            }
+            await TestWait.ForTaskAsync(cancellationStarted.Task, "the previous cancellation callback to start");
+            await harness.RemoveFromTreeAsync();
+        }
+        finally
+        {
+            releaseCancellation.Set();
+            route.Release();
+        }
+        await TestWait.ForTaskAsync(replacementCompletion.Completed, "the replacement source change to finish");
+        await harness.SettleAsync();
+
+        Assert.AreEqual(0, replacementStarts);
+        Assert.AreEqual(0, harness.FailedCount);
+        Assert.AreEqual(0, harness.OpenedCount);
+        Assert.IsNull(harness.DisplayedSource);
+    }
+
+    // AsyncVoidMethodBuilder reports completion to the context captured by the source setter.
+    private sealed class SourceChangeContext(SynchronizationContext dispatcher) : SynchronizationContext
+    {
+        private readonly TaskCompletionSource _completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _operations;
+        public Task Completed => _completed.Task;
+
+        public override void OperationStarted() => Interlocked.Increment(ref _operations);
+        public override void OperationCompleted()
+        {
+            if (Interlocked.Decrement(ref _operations) == 0) _completed.TrySetResult();
+        }
+
+        public override void Post(SendOrPostCallback callback, object? state) => dispatcher.Post(callback, state);
+    }
+
     // The late-completion tests below deliver a real decoded image after its request was retired.
     [UITestMethod]
     public async Task Replacement_rejects_a_resolved_late_image_and_natural_size()

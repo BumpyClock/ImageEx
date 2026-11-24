@@ -151,10 +151,11 @@ internal sealed partial class ImageExCacheManager
         }
     }
 
-    internal static void RemoveAbandonedOriginalFiles(string directory, DateTime cutoffUtc)
+    internal static void RemoveAbandonedSourceFiles(string directory, DateTime cutoffUtc)
     {
         if (!Directory.Exists(directory)) return;
-        foreach (var path in Directory.EnumerateFiles(directory, "original-*.tmp"))
+        foreach (var path in Directory.EnumerateFiles(directory, "original-*.tmp")
+            .Concat(Directory.EnumerateFiles(directory, "source-*.tmp")))
         {
             try
             {

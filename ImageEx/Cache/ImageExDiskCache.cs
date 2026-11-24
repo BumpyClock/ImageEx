@@ -50,18 +50,32 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
         _cacheDir = cacheDirectory;
         _metadataPath = Path.Combine(_cacheDir, ImageExCacheConstants.MetadataFileName);
         _metadataWriter = metadataWriter ?? WriteMetadataFileAsync;
-        _fileWriter = fileWriter ?? WriteCacheFileAsync;
+        _fileWriter = fileWriter ?? WriteSourceBytesAsync;
         _metadataDebounce = metadataDebounce ?? DefaultMetadataDebounce;
         _metadataMaximumDelay = metadataMaximumDelay ?? DefaultMetadataMaximumDelay;
     }
 
-    internal Task WriteFileAsync(string path, ReadOnlyMemory<byte> bytes, CancellationToken token)
-        => _fileWriter(path, bytes, token);
-
-    private static async Task WriteCacheFileAsync(string path, ReadOnlyMemory<byte> bytes, CancellationToken token)
+    internal async Task WriteFileAsync(string path, ReadOnlyMemory<byte> bytes, CancellationToken token)
     {
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        await using var stream = new FileStream(path, FileMode.Create, FileAccess.Write,
+        var directory = Path.GetDirectoryName(path)!;
+        Directory.CreateDirectory(directory);
+        var pending = Path.Combine(directory, $"source-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            await _fileWriter(pending, bytes, token).ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            File.Move(pending, path, overwrite: true);
+        }
+        catch
+        {
+            TryDeleteFile(pending);
+            throw;
+        }
+    }
+
+    private static async Task WriteSourceBytesAsync(string path, ReadOnlyMemory<byte> bytes, CancellationToken token)
+    {
+        await using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write,
             FileShare.None, bufferSize: 64 * 1024, useAsync: true);
         await stream.WriteAsync(bytes, token).ConfigureAwait(false);
     }
