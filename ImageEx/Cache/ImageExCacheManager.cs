@@ -2081,31 +2081,36 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
     {
         await operationsDrained.ConfigureAwait(false);
         _originalShutdown.Dispose();
-        await _diskCache.FlushMetadataAsync().ConfigureAwait(false);
-        await _diskCache.DisposeAsync().ConfigureAwait(false);
-        _cleanupLock.Dispose();
-        _downloadConcurrency.Dispose();
-        _decodeConcurrency.Dispose();
-        _decodePersistenceConcurrency.Dispose();
-        CacheWriteLock[] writeLocks;
-        lock (_cacheWriteLocksGate)
+        try
         {
-            writeLocks = _cacheWriteLocks.Values.ToArray();
-            _cacheWriteLocks.Clear();
+            await _diskCache.DisposeAsync().ConfigureAwait(false);
         }
-
-        foreach (var writeLock in writeLocks)
+        finally
         {
-            writeLock.Dispose();
-        }
+            _cleanupLock.Dispose();
+            _downloadConcurrency.Dispose();
+            _decodeConcurrency.Dispose();
+            _decodePersistenceConcurrency.Dispose();
+            CacheWriteLock[] writeLocks;
+            lock (_cacheWriteLocksGate)
+            {
+                writeLocks = _cacheWriteLocks.Values.ToArray();
+                _cacheWriteLocks.Clear();
+            }
 
-        lock (_smallDecodedImageCacheLock)
-        {
-            _smallDecodedImageCache.Clear();
-            _smallDecodedImageCacheLru.Clear();
-            _smallDecodedImageCacheBytes = 0;
-        }
+            foreach (var writeLock in writeLocks)
+            {
+                writeLock.Dispose();
+            }
 
-        GC.SuppressFinalize(this);
+            lock (_smallDecodedImageCacheLock)
+            {
+                _smallDecodedImageCache.Clear();
+                _smallDecodedImageCacheLru.Clear();
+                _smallDecodedImageCacheBytes = 0;
+            }
+
+            GC.SuppressFinalize(this);
+        }
     }
 }

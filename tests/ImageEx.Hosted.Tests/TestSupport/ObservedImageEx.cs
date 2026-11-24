@@ -9,6 +9,7 @@ public sealed class ObservedImageEx : ImageExControl
 {
     private readonly Dictionary<string, LateCompletion> _held = new(StringComparer.Ordinal);
     private readonly List<Task> _resolves = new();
+    internal Action<Uri, CancellationToken>? ResolveStarted { get; set; }
 
     internal LateCompletion HoldCompletion(Uri uri)
     {
@@ -30,6 +31,7 @@ public sealed class ObservedImageEx : ImageExControl
 
     protected override Task<ImageLoadResult> ResolveImageAsync(Uri imageUri, CancellationToken token)
     {
+        ResolveStarted?.Invoke(imageUri, token);
         var resolve = _held.Remove(imageUri.AbsoluteUri, out var completion)
             ? ResolveThenHoldAsync(imageUri, completion)
             : base.ResolveImageAsync(imageUri, token);

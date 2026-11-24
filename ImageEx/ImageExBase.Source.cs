@@ -74,6 +74,7 @@ namespace ImageEx
             _isInViewport = false;
             _lastEffectiveViewport = null;
             Interlocked.Increment(ref _viewportStateGeneration);
+            Interlocked.Increment(ref _sourceRequestVersion);
             CancelPendingOffscreenDetach();
             CleanupTokenSource();
 
