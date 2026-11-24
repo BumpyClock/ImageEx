@@ -66,9 +66,10 @@ internal sealed class ImageExDiskCache : IAsyncDisposable
             token.ThrowIfCancellationRequested();
             File.Move(pending, path, overwrite: true);
         }
-        finally
+        catch
         {
             TryDeleteFile(pending);
+            throw;
         }
     }
 
