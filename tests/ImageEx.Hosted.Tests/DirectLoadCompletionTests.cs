@@ -151,7 +151,7 @@ public sealed class DirectLoadCompletionTests
         await using var harness = await ControlHarness.CreateAsync(manager);
         var cancellationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var releaseCancellation = new ManualResetEventSlim();
-        var cancellationReturned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var replacementCompletion = new SourceChangeContext(SynchronizationContext.Current!);
         var replacementStarts = 0;
         harness.Control.ResolveStarted = (uri, token) =>
         {
@@ -161,14 +161,22 @@ public sealed class DirectLoadCompletionTests
                 {
                     cancellationStarted.TrySetResult();
                     releaseCancellation.Wait(TestWait.DefaultTimeout);
-                    cancellationReturned.TrySetResult();
                 });
         };
         harness.Control.Source = first;
         try
         {
             await route.WaitUntilStartedAsync();
-            harness.Control.Source = replacement;
+            var previousContext = SynchronizationContext.Current;
+            try
+            {
+                SynchronizationContext.SetSynchronizationContext(replacementCompletion);
+                harness.Control.Source = replacement;
+            }
+            finally
+            {
+                SynchronizationContext.SetSynchronizationContext(previousContext);
+            }
             await TestWait.ForTaskAsync(cancellationStarted.Task, "the previous cancellation callback to start");
             await harness.RemoveFromTreeAsync();
         }
@@ -177,13 +185,29 @@ public sealed class DirectLoadCompletionTests
             releaseCancellation.Set();
             route.Release();
         }
-        await TestWait.ForTaskAsync(cancellationReturned.Task, "the previous cancellation callback to return");
+        await TestWait.ForTaskAsync(replacementCompletion.Completed, "the replacement source change to finish");
         await harness.SettleAsync();
 
         Assert.AreEqual(0, replacementStarts);
         Assert.AreEqual(0, harness.FailedCount);
         Assert.AreEqual(0, harness.OpenedCount);
         Assert.IsNull(harness.DisplayedSource);
+    }
+
+    // AsyncVoidMethodBuilder reports completion to the context captured by the source setter.
+    private sealed class SourceChangeContext(SynchronizationContext dispatcher) : SynchronizationContext
+    {
+        private readonly TaskCompletionSource _completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _operations;
+        public Task Completed => _completed.Task;
+
+        public override void OperationStarted() => Interlocked.Increment(ref _operations);
+        public override void OperationCompleted()
+        {
+            if (Interlocked.Decrement(ref _operations) == 0) _completed.TrySetResult();
+        }
+
+        public override void Post(SendOrPostCallback callback, object? state) => dispatcher.Post(callback, state);
     }
 
     // The late-completion tests below deliver a real decoded image after its request was retired.
