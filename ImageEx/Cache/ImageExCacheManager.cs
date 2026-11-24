@@ -1992,7 +1992,7 @@ internal sealed partial class ImageExCacheManager : IDisposable, IAsyncDisposabl
             _lastCleanup = now;
             var removed = 0;
             long freedBytes = 0;
-            RemoveAbandonedOriginalFiles(
+            RemoveAbandonedSourceFiles(
                 Path.GetDirectoryName(_diskCache.GetFilePath("original-temp", ".tmp"))!,
                 now.UtcDateTime - TimeSpan.FromDays(1));
 
